@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import time
+from database import init_database, save_player, load_player
 
 import discord
 from discord.ext import commands
@@ -22,6 +23,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+init_database()
 
 
 # =========================================================
@@ -114,42 +116,102 @@ def stars(difficulty: int) -> str:
 
 
 def get_player(user):
+
     if user.id not in players:
-        players[user.id] = {
-            "name": user.display_name,
-            "profile_started": False,
-            "house": None,
-            "ready": False,
-            "stats": {
-                "endurance": 0,
-                "magic_power": 0,
-                "speed": 0,
-                "agility": 0,
-            },
-            "talent_points": 0,
-            "hp": 100,
-            "max_hp": 100,
-            "level": 1,
-            "xp": 0,
-            "learned_spells": set(STARTING_SPELLS),
-            "spell_levels": {spell_key: (1 if spell_key in STARTING_SPELLS else 0) for spell_key in SPELLS},
-            "spell_xp": {spell_key: 0 for spell_key in SPELLS},
-            "duel_wins": 0,
-            "duel_losses": 0,
-            "duels_completed": 0,
-            "duels_since_avada": 5,
-            "combat_stats": {
-                "successful_attacks": 0,
-                "successful_dodges": 0,
-                "successful_protegos": 0,
-                "successful_counters": 0,
-                "successful_control_spells": 0,
-            },
-            "spell_hits": {spell_key: 0 for spell_key in SPELLS},
-        }
-    else:
-        players[user.id]["name"] = user.display_name
+
+        saved_player = load_player(
+            user.id
+        )
+
+        if saved_player is not None:
+
+            players[user.id] = (
+                saved_player
+            )
+
+        else:
+
+            players[user.id] = {
+
+                "user_id": user.id,
+
+                "name": user.display_name,
+
+                "profile_started": False,
+                "house": None,
+                "ready": False,
+
+                "stats": {
+                    "endurance": 0,
+                    "magic_power": 0,
+                    "speed": 0,
+                    "agility": 0,
+                },
+
+                "talent_points": 0,
+
+                "hp": 100,
+                "max_hp": 100,
+
+                "level": 1,
+                "xp": 0,
+
+                "learned_spells": set(
+                    STARTING_SPELLS
+                ),
+
+                "spell_levels": {
+                    spell_key:
+                        1
+                        if spell_key in STARTING_SPELLS
+                        else 0
+
+                    for spell_key in SPELLS
+                },
+
+                "spell_xp": {
+                    spell_key: 0
+                    for spell_key in SPELLS
+                },
+
+                "duel_wins": 0,
+                "duel_losses": 0,
+                "duels_completed": 0,
+
+                "duels_since_avada": 5,
+
+                "combat_stats": {
+                    "successful_attacks": 0,
+                    "successful_dodges": 0,
+                    "successful_protegos": 0,
+                    "successful_counters": 0,
+                    "successful_control_spells": 0,
+                },
+
+                "spell_hits": {
+                    spell_key: 0
+                    for spell_key in SPELLS
+                },
+            }
+
+            save_player(
+                user.id,
+                players[user.id]
+            )
+
+    players[user.id]["name"] = (
+        user.display_name
+    )
+
     return players[user.id]
+
+
+def persist_player(player):
+
+    save_player(
+        player["user_id"],
+        player
+    )
 
 
 def knows_spell(player, spell_name):
@@ -176,11 +238,16 @@ def update_player_level(player):
 
 
 def gain_player_xp(player, amount):
-    old_level = player["level"]
-    player["xp"] += amount
-    update_player_level(player)
-    return player["level"] > old_level
 
+    old_level = player["level"]
+
+    player["xp"] += amount
+
+    update_player_level(player)
+
+    persist_player(player)
+
+    return player["level"] > old_level
 
 def gain_spell_xp(player, spell_name, amount):
     if spell_name not in player["spell_xp"]:
@@ -190,6 +257,7 @@ def gain_spell_xp(player, spell_name, amount):
     new_level = 1 + player["spell_xp"][spell_name] // 100
     old_level = player["spell_levels"][spell_name]
     player["spell_levels"][spell_name] = max(old_level, new_level)
+    persist_player(player)
 
 
 # =========================================================
@@ -442,6 +510,8 @@ async def check_duel_end(ctx, loser):
         participant["duels_since_avada"] += 1
 
     leveled_up = gain_player_xp(winner_player, 50)
+    persist_player(winner_player)
+    persist_player(loser_player)
 
     await ctx.send(
         f"🏆 **DUEL OVER!**\n"
@@ -522,6 +592,7 @@ async def apply_attack(ctx, defender_user, attack):
 
         attacker["combat_stats"]["successful_attacks"] += 1
         attacker["spell_hits"]["confringo"] += 1
+        persist_player(attacker)
 
         await ctx.send(
             f"🔥 **Confringo hits {defender_user.display_name}!**\n"
@@ -681,6 +752,7 @@ async def profile(ctx):
 
     if player["house"] is None:
         player["profile_started"] = True
+        persist_player(player)
         await ctx.send(
             "🧙 **Create Your Wizard**\n\n"
             "Choose your House:\n\n"
@@ -746,6 +818,7 @@ async def house(ctx, house_name: str):
     player["talent_points"] = 3
     update_max_hp(player)
     player["hp"] = player["max_hp"]
+    persist_player(player)
 
     stats = player["stats"]
     await ctx.send(
@@ -809,6 +882,8 @@ async def train(ctx, stat_name: str):
             "✅ **Your character is ready!**\n"
             "You can now participate in Duels."
         )
+
+    persist_player(player)
 
 
 # =========================================================
@@ -1036,6 +1111,7 @@ async def answer(ctx, choice: str):
         player["learned_spells"].add(spell_key)
         player["spell_levels"][spell_key] = 1
         player["spell_xp"][spell_key] = 0
+        persist_player(player)
 
         await ctx.send(
             f"{result_text}\n\n"
@@ -1308,6 +1384,7 @@ async def avadakedavra(ctx):
 
     # The attempt is consumed immediately, hit or miss.
     player["duels_since_avada"] = 0
+    persist_player(player)
 
     # Hidden 1d6 roll: 5-6 succeeds, 1-4 misses.
     if random.randint(1, 6) < 5:
