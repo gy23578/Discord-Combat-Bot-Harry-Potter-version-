@@ -1,4 +1,4 @@
-STARTING_SPELLS = {"confringo", "protego", "expelliarmus"}
+STARTING_SPELLS = {"confringo", "protego", "expelliarmus", "stupefy"}
 
 QUIZ_RULES = {
     1: {"questions": 3, "required_score": 2},
@@ -39,9 +39,9 @@ SPELLS = {
 "stupefy": {
     "display_name": "Stupefy",
     "emoji": "🔴",
-    "difficulty": 4,
-    "starting": False,
-    "categories": ["general", "spells", "hogwarts", "characters"],
+    "difficulty": 0,
+    "starting": True,
+    "categories": [ "spells"],
     "requirements": {},
     "description": "A combat spell focused on control and interruption.",
 },

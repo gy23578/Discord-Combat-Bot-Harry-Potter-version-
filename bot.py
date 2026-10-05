@@ -18,6 +18,7 @@ from spells import QUIZ_RULES, SPELLS, STARTING_SPELLS
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+OWNER_ID = int(os.getenv("BOT_OWNER_ID"))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -100,6 +101,12 @@ teacher_help = {}
 # HELPERS
 # =========================================================
 
+
+
+def is_owner(user):
+    return user.id == OWNER_ID
+
+
 def normalize_spell_name(name: str) -> str:
     return (
         name.lower()
@@ -113,6 +120,14 @@ def stars(difficulty: int) -> str:
     if difficulty <= 0:
         return "Starting Spell"
     return "★" * difficulty + "☆" * (5 - difficulty)
+
+def persist_player(player):
+
+    save_player(
+        player["user_id"],
+        player
+    )
+
 
 
 def get_player(user):
@@ -203,15 +218,35 @@ def get_player(user):
         user.display_name
     )
 
-    return players[user.id]
+    player = players[user.id]
+
+    for spell_name in STARTING_SPELLS:
+
+        if spell_name not in player["learned_spells"]:
+            player["learned_spells"].add(
+                spell_name
+            )
+
+            player["spell_levels"][spell_name] = max(
+                1,
+                player["spell_levels"].get(
+                    spell_name,
+                    0
+                )
+            )
+
+            player["spell_xp"].setdefault(
+                spell_name,
+                0
+            )
+
+    persist_player(player)
+
+    return player
 
 
-def persist_player(player):
 
-    save_player(
-        player["user_id"],
-        player
-    )
+
 
 
 def knows_spell(player, spell_name):
@@ -494,6 +529,7 @@ async def check_duel_end(ctx, loser):
         return False
 
     loser_player["hp"] = 0
+
     winner_id = active_duels.get(loser.id)
 
     if winner_id is None:
@@ -502,6 +538,7 @@ async def check_duel_end(ctx, loser):
     winner = await bot.fetch_user(winner_id)
     winner_player = get_player(winner)
 
+    # Duel statistics
     winner_player["duel_wins"] += 1
     loser_player["duel_losses"] += 1
 
@@ -509,7 +546,18 @@ async def check_duel_end(ctx, loser):
         participant["duels_completed"] += 1
         participant["duels_since_avada"] += 1
 
-    leveled_up = gain_player_xp(winner_player, 50)
+    # XP rewards
+    winner_leveled_up = gain_player_xp(
+        winner_player,
+        50
+    )
+
+    loser_leveled_up = gain_player_xp(
+        loser_player,
+        20
+    )
+
+    # Save both players
     persist_player(winner_player)
     persist_player(loser_player)
 
@@ -517,14 +565,23 @@ async def check_duel_end(ctx, loser):
         f"🏆 **DUEL OVER!**\n"
         f"✨ {winner.display_name} defeats {loser.display_name}!\n"
         f"❤️ {loser.display_name}: **0/{loser_player['max_hp']} HP**\n"
-        f"⭐ {winner.display_name} earns **50 XP**."
+        f"⭐ {winner.display_name} earns **50 XP**.\n"
+        f"⭐ {loser.display_name} earns **20 XP**."
     )
 
-    if leveled_up:
+    if winner_leveled_up:
         await ctx.send(
-            f"🌟 **{winner.display_name} reached Level {winner_player['level']}!**"
+            f"🌟 **{winner.display_name} reached "
+            f"Level {winner_player['level']}!**"
         )
 
+    if loser_leveled_up:
+        await ctx.send(
+            f"🌟 **{loser.display_name} reached "
+            f"Level {loser_player['level']}!**"
+        )
+
+    # Clean Duel state
     for user_id in (loser.id, winner_id):
         active_duels.pop(user_id, None)
         pending_attacks.pop(user_id, None)
@@ -605,21 +662,64 @@ async def apply_attack(ctx, defender_user, attack):
         await check_duel_end(ctx, defender_user)
 
     elif spell == "expelliarmus":
+
+        damage = attack["damage"]
         duration = attack["duration"]
-        status_effects[defender_user.id] = {
-            "unarmed_until": time.time() + duration
-        }
+
+        # Deal small damage
+        defender["hp"] = max(
+            0,
+            defender["hp"] - damage
+        )
 
         attacker["combat_stats"]["successful_attacks"] += 1
         attacker["spell_hits"]["expelliarmus"] += 1
 
-        await ctx.send(
-            f"⚡ **Expelliarmus hits {defender_user.display_name}!**\n"
-            f"🪄 {defender_user.display_name} is unarmed for **{duration} seconds**!"
+        gain_player_xp(
+            attacker,
+            10
         )
 
-        gain_player_xp(attacker, 10)
-        gain_spell_xp(attacker, "expelliarmus", 15)
+        gain_spell_xp(
+            attacker,
+            "expelliarmus",
+            15
+        )
+
+        # If Expelliarmus finishes the opponent,
+        # end the Duel immediately
+        if defender["hp"] <= 0:
+            await ctx.send(
+                f"⚡ **Expelliarmus hits "
+                f"{defender_user.display_name}!**\n"
+                f"💥 Damage: **{damage}**\n"
+                f"❤️ HP: **0/{defender['max_hp']}**"
+            )
+
+            await check_duel_end(
+                ctx,
+                defender_user
+            )
+
+            return
+
+        # Apply the disarm if the opponent survives
+        status_effects[
+            defender_user.id
+        ] = {
+            "unarmed_until":
+                time.time() + duration
+        }
+
+        await ctx.send(
+            f"⚡ **Expelliarmus hits "
+            f"{defender_user.display_name}!**\n"
+            f"💥 Damage: **{damage}**\n"
+            f"🪄 {defender_user.display_name} "
+            f"is unarmed for **{duration} seconds**!\n"
+            f"❤️ HP: "
+            f"**{defender['hp']}/{defender['max_hp']}**"
+        )
 
     elif spell == "sectumsempra":
         damage = attack["damage"]
@@ -1426,8 +1526,7 @@ async def protego(ctx):
         await ctx.send(
             f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
             f"✨ The Attack is blocked!\n"
-            f"⚔️ Attack: **{attack['power']}**\n"
-            f"🛡️ Defense: **{defense_power}**"
+
         )
 
         await apply_sectumsempra_backlash(ctx, attack, defense_power)
@@ -1435,8 +1534,7 @@ async def protego(ctx):
         await ctx.send(
             f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
             f"💥 Protego is broken!\n"
-            f"⚔️ Attack: **{attack['power']}**\n"
-            f"🛡️ Defense: **{defense_power}**"
+
         )
         await apply_attack(ctx, ctx.author, attack)
 
@@ -1462,15 +1560,13 @@ async def dodge(ctx):
         await ctx.send(
             f"💨 **{ctx.author.display_name} Dodges!**\n"
             f"✨ {SPELLS[attack['spell']]['display_name'].upper()} misses!\n"
-            f"⚡ Spell Speed: **{attack_accuracy}**\n"
-            f"💨 Dodge: **{dodge_power}**"
+
         )
     else:
         await ctx.send(
             f"💨 **{ctx.author.display_name} tries to Dodge!**\n"
             f"❌ The Dodge fails.\n"
-            f"⚡ Spell Speed: **{attack_accuracy}**\n"
-            f"💨 Dodge: **{dodge_power}**"
+
         )
         await apply_attack(ctx, ctx.author, attack)
 
@@ -1509,8 +1605,7 @@ async def expelliarmus(ctx):
                 f"⚡ **{ctx.author.display_name} counters with EXPELLIARMUS!**\n"
                 f"💥 {SPELLS[incoming_attack['spell']]['display_name'].upper()} is interrupted!\n"
                 f"🪄 {attacker.display_name} is unarmed for **4 seconds**!\n"
-                f"⚡ Expelliarmus: **{expelliarmus_power}**\n"
-                f"🔥 Incoming Attack: **{incoming_attack['power']}**"
+
             )
 
             gain_player_xp(player, 10)
@@ -1520,15 +1615,25 @@ async def expelliarmus(ctx):
             await ctx.send(
                 f"⚡ **{ctx.author.display_name} counters with EXPELLIARMUS!**\n"
                 f"❌ The counter fails.\n"
-                f"⚡ Expelliarmus: **{expelliarmus_power}**\n"
-                f"🔥 Incoming Attack: **{incoming_attack['power']}**"
+
             )
             await apply_attack(ctx, ctx.author, incoming_attack)
 
         return
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
-    accuracy = calculate_spell_accuracy(player, "expelliarmus")
+
+    accuracy = calculate_spell_accuracy(
+        player,
+        "expelliarmus"
+    )
+
+    spell_level = player["spell_levels"]["expelliarmus"]
+
+    damage = (
+            random.randint(3, 7)
+            + (spell_level - 1)
+    )
 
     await launch_attack(
         ctx,
@@ -1536,6 +1641,7 @@ async def expelliarmus(ctx):
         "expelliarmus",
         expelliarmus_power,
         accuracy,
+        damage=damage,
         duration=4,
         base_cooldown=6,
     )
@@ -1603,6 +1709,422 @@ async def bombarda(ctx):
 @bot.command(name="arrestomomentum")
 async def arresto_momentum(ctx):
     await not_yet_modeled_spell(ctx, "arrestomomentum")
+
+# =========================================================
+# OWNER / ADMIN COMMANDS
+# =========================================================
+
+
+
+@bot.command()
+async def setstat(
+        ctx,
+        target: discord.Member,
+        stat_name: str,
+        value: int
+):
+
+    if not is_owner(ctx.author):
+        await ctx.send(
+            "❌ You are not allowed to use this command."
+        )
+        return
+
+    player = get_player(target)
+
+    stat_name = stat_name.lower()
+
+    if stat_name == "magicpower":
+        stat_name = "magic_power"
+
+    valid_stats = {
+        "endurance",
+        "magic_power",
+        "speed",
+        "agility"
+    }
+
+    if stat_name not in valid_stats:
+        await ctx.send(
+            "❌ Invalid stat."
+        )
+        return
+
+    player["stats"][stat_name] = value
+
+    if stat_name == "endurance":
+
+        update_max_hp(player)
+
+        if player["hp"] > player["max_hp"]:
+            player["hp"] = player["max_hp"]
+
+    persist_player(player)
+
+    display_name = (
+        stat_name
+        .replace("_", " ")
+        .title()
+    )
+
+    await ctx.send(
+        f"✅ {target.display_name}'s "
+        f"{display_name} was set to "
+        f"**{value}**."
+    )
+
+    @bot.command()
+    async def addspell(
+            ctx,
+            target: discord.Member,
+            spell_name: str
+    ):
+
+        if not is_owner(ctx.author):
+            await ctx.send(
+                "❌ You are not allowed to use this command."
+            )
+            return
+
+        spell_name = spell_name.lower()
+
+        if spell_name not in SPELLS:
+            await ctx.send(
+                "❌ Unknown spell."
+            )
+            return
+
+        player = get_player(target)
+
+        player["learned_spells"].add(
+            spell_name
+        )
+
+        player["spell_levels"][spell_name] = max(
+            1,
+            player["spell_levels"].get(
+                spell_name,
+                0
+            )
+        )
+
+        player["spell_xp"].setdefault(
+            spell_name,
+            0
+        )
+
+        persist_player(player)
+
+        await ctx.send(
+            f"✅ {SPELLS[spell_name]['display_name']} "
+            f"was added to "
+            f"{target.display_name}."
+        )
+
+        @bot.command()
+        async def addspell(
+                ctx,
+                target: discord.Member,
+                spell_name: str
+        ):
+
+            if not is_owner(ctx.author):
+                await ctx.send(
+                    "❌ You are not allowed to use this command."
+                )
+                return
+
+            spell_name = spell_name.lower()
+
+            if spell_name not in SPELLS:
+                await ctx.send(
+                    "❌ Unknown spell."
+                )
+                return
+
+            player = get_player(target)
+
+            player["learned_spells"].add(
+                spell_name
+            )
+
+            player["spell_levels"][spell_name] = max(
+                1,
+                player["spell_levels"].get(
+                    spell_name,
+                    0
+                )
+            )
+
+            player["spell_xp"].setdefault(
+                spell_name,
+                0
+            )
+
+            persist_player(player)
+
+            await ctx.send(
+                f"✅ {SPELLS[spell_name]['display_name']} "
+                f"was added to "
+                f"{target.display_name}."
+            )
+
+            @bot.command()
+            async def setlevel(
+                    ctx,
+                    target: discord.Member,
+                    value: int
+            ):
+
+                if not is_owner(ctx.author):
+                    await ctx.send(
+                        "❌ You are not allowed to use this command."
+                    )
+                    return
+
+                if value < 1:
+                    await ctx.send(
+                        "❌ Level must be at least 1."
+                    )
+                    return
+
+                player = get_player(target)
+
+                player["level"] = value
+                player["xp"] = (
+                                       value - 1
+                               ) * 100
+
+                persist_player(player)
+
+                await ctx.send(
+                    f"✅ {target.display_name} "
+                    f"is now Level **{value}**."
+                )
+
+
+@bot.command()
+async def setxp(
+        ctx,
+        target: discord.Member,
+        value: int
+):
+
+    if not is_owner(ctx.author):
+        await ctx.send(
+            "❌ You are not allowed to use this command."
+        )
+        return
+
+    player = get_player(target)
+
+    player["xp"] = max(
+        0,
+        value
+    )
+
+    update_player_level(player)
+
+    persist_player(player)
+
+    await ctx.send(
+        f"✅ {target.display_name}'s XP "
+        f"was set to **{player['xp']}**."
+    )
+
+
+@bot.command()
+async def addxp(
+        ctx,
+        target: discord.Member,
+        amount: int
+):
+
+    if not is_owner(ctx.author):
+        await ctx.send(
+            "❌ You are not allowed to use this command."
+        )
+        return
+
+    player = get_player(target)
+
+    gain_player_xp(
+        player,
+        amount
+    )
+
+    await ctx.send(
+        f"✅ Added **{amount} XP** to "
+        f"{target.display_name}."
+    )
+
+@bot.command()
+async def setspelllevel(
+        ctx,
+        target: discord.Member,
+        spell_name: str,
+        level: int
+):
+
+    if not is_owner(ctx.author):
+        await ctx.send(
+            "❌ You are not allowed to use this command."
+        )
+        return
+
+    spell_name = spell_name.lower()
+
+    if spell_name not in SPELLS:
+        await ctx.send(
+            "❌ Unknown spell."
+        )
+        return
+
+    if level < 1:
+        await ctx.send(
+            "❌ Spell Level must be at least 1."
+        )
+        return
+
+    player = get_player(target)
+
+    player["learned_spells"].add(
+        spell_name
+    )
+
+    player["spell_levels"][spell_name] = level
+
+    player["spell_xp"][spell_name] = (
+        level - 1
+    ) * 100
+
+    persist_player(player)
+
+    await ctx.send(
+        f"✅ {target.display_name}'s "
+        f"{SPELLS[spell_name]['display_name']} "
+        f"is now Spell Level **{level}**."
+    )
+
+
+@bot.command()
+async def settpoints(
+        ctx,
+        target: discord.Member,
+        value: int
+):
+
+    if not is_owner(ctx.author):
+        await ctx.send(
+            "❌ You are not allowed to use this command."
+        )
+        return
+
+    player = get_player(target)
+
+    player["talent_points"] = max(
+        0,
+        value
+    )
+
+    persist_player(player)
+
+    await ctx.send(
+        f"✅ {target.display_name} now has "
+        f"**{player['talent_points']} Talent Points**."
+    )
+
+    @bot.command()
+    async def sethouse(
+            ctx,
+            target: discord.Member,
+            house_name: str
+    ):
+
+        if not is_owner(ctx.author):
+            await ctx.send(
+                "❌ You are not allowed to use this command."
+            )
+            return
+
+        house_name = house_name.lower()
+
+        if house_name not in HOUSE_STATS:
+            await ctx.send(
+                "❌ Unknown House."
+            )
+            return
+
+        player = get_player(target)
+
+        player["house"] = house_name
+        player["profile_started"] = True
+        player["ready"] = True
+
+        player["stats"] = (
+            HOUSE_STATS[
+                house_name
+            ].copy()
+        )
+
+        update_max_hp(player)
+
+        player["hp"] = (
+            player["max_hp"]
+        )
+
+        persist_player(player)
+
+        await ctx.send(
+            f"✅ {target.display_name} was moved to "
+            f"**{HOUSE_NAMES[house_name]}**."
+        )
+
+@bot.command()
+async def sethouse(
+        ctx,
+        target: discord.Member,
+        house_name: str
+):
+
+    if not is_owner(ctx.author):
+        await ctx.send(
+            "❌ You are not allowed to use this command."
+        )
+        return
+
+    house_name = house_name.lower()
+
+    if house_name not in HOUSE_STATS:
+        await ctx.send(
+            "❌ Unknown House."
+        )
+        return
+
+    player = get_player(target)
+
+    player["house"] = house_name
+    player["profile_started"] = True
+    player["ready"] = True
+
+    player["stats"] = (
+        HOUSE_STATS[
+            house_name
+        ].copy()
+    )
+
+    update_max_hp(player)
+
+    player["hp"] = (
+        player["max_hp"]
+    )
+
+    persist_player(player)
+
+    await ctx.send(
+        f"✅ {target.display_name} was moved to "
+        f"**{HOUSE_NAMES[house_name]}**."
+    )
 
 
 # =========================================================
