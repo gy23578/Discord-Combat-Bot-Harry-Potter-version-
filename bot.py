@@ -81,9 +81,33 @@ COMBAT_STAT_DISPLAY_NAMES = {
 }
 
 
+
+# =========================================================
+# SPELL SPEED
+# Higher value = harder to Dodge.
+# Player Speed and Spell Speed are both used.
+# =========================================================
+
+SPELL_SPEEDS = {
+    "confringo": 6,
+    "protego": 0,
+    "expelliarmus": 9,
+    "stupefy": 8,
+    "incendio": 6,
+    "levioso": 7,
+    "diffindo": 8,
+    "depulso": 7,
+    "glacius": 6,
+    "petrificustotalus": 5,
+    "bombarda": 4,
+    "arrestomomentum": 6,
+    "sectumsempra": 6,
+    "avadakedavra": 8,
+}
+
 # =========================================================
 # GAME DATA
-# NOTE: this is still memory-only. Restarting the bot resets it.
+# NOTE: duel/combat state is memory-only. Player progression is persisted in SQLite.
 # =========================================================
 
 players = {}
@@ -220,6 +244,44 @@ def get_player(user):
 
     player = players[user.id]
 
+    # Lightweight migration for older saved profiles.
+    player.setdefault("profile_started", False)
+    player.setdefault("house", None)
+    player.setdefault("ready", False)
+    player.setdefault("talent_points", 0)
+    player.setdefault("hp", 100)
+    player.setdefault("max_hp", 100)
+    player.setdefault("level", 1)
+    player.setdefault("xp", 0)
+    player.setdefault("duel_wins", 0)
+    player.setdefault("duel_losses", 0)
+    player.setdefault("duels_completed", 0)
+    player.setdefault("duels_since_avada", 5)
+
+    player.setdefault("stats", {})
+    for stat_name in ("endurance", "magic_power", "speed", "agility"):
+        player["stats"].setdefault(stat_name, 0)
+
+    player.setdefault("learned_spells", set())
+    if not isinstance(player["learned_spells"], set):
+        player["learned_spells"] = set(player["learned_spells"])
+
+    player.setdefault("spell_levels", {})
+    player.setdefault("spell_xp", {})
+    player.setdefault("spell_hits", {})
+
+    for spell_key in SPELLS:
+        player["spell_levels"].setdefault(
+            spell_key,
+            1 if spell_key in STARTING_SPELLS else 0
+        )
+        player["spell_xp"].setdefault(spell_key, 0)
+        player["spell_hits"].setdefault(spell_key, 0)
+
+    player.setdefault("combat_stats", {})
+    for stat_name in COMBAT_STAT_DISPLAY_NAMES:
+        player["combat_stats"].setdefault(stat_name, 0)
+
     for spell_name in STARTING_SPELLS:
 
         if spell_name not in player["learned_spells"]:
@@ -272,17 +334,23 @@ def update_player_level(player):
     player["level"] = 1 + player["xp"] // 100
 
 
+def talent_points_for_level(level):
+    return 3 if level >= 5 else 2
+
+
 def gain_player_xp(player, amount):
-
     old_level = player["level"]
-
-    player["xp"] += amount
-
+    player["xp"] = max(0, player["xp"] + amount)
     update_player_level(player)
+    new_level = player["level"]
+
+    if new_level > old_level:
+        for reached_level in range(old_level + 1, new_level + 1):
+            player["talent_points"] += talent_points_for_level(reached_level)
 
     persist_player(player)
+    return new_level > old_level
 
-    return player["level"] > old_level
 
 def gain_spell_xp(player, spell_name, amount):
     if spell_name not in player["spell_xp"]:
@@ -310,6 +378,23 @@ def remaining_unarmed_time(user_id):
         return 0
     return max(0, status_effects[user_id]["unarmed_until"] - time.time())
 
+
+
+
+# =========================================================
+# STUNNED STATUS
+# =========================================================
+
+def is_stunned(user_id):
+    if user_id not in status_effects:
+        return False
+    return time.time() < status_effects[user_id].get("stunned_until", 0)
+
+
+def remaining_stun_time(user_id):
+    if not is_stunned(user_id):
+        return 0
+    return max(0, status_effects[user_id]["stunned_until"] - time.time())
 
 # =========================================================
 # COOLDOWN
@@ -366,9 +451,16 @@ def calculate_protego_power(player):
 
 
 def calculate_spell_accuracy(player, spell_name):
-    speed = player["stats"]["speed"]
+    player_speed = player["stats"]["speed"]
     spell_level = player["spell_levels"][spell_name]
-    return random.randint(1, 20) + speed + spell_level * 3
+    spell_speed = SPELL_SPEEDS.get(spell_name, 6)
+
+    return (
+        random.randint(1, 20)
+        + player_speed
+        + spell_speed
+        + spell_level * 3
+    )
 
 
 def calculate_dodge_power(player):
@@ -386,6 +478,26 @@ def finish_attack(attack):
 # SPELLBOOK REQUIREMENTS
 # =========================================================
 
+def ravenclaw_requirement(player, kind, required):
+    if player.get("house") != "ravenclaw":
+        return required
+
+    if kind == "min_stat":
+        return max(1, required - 1)
+
+    if kind == "spell_level" and required >= 3:
+        return required - 1
+
+    if kind == "duel_wins" and required >= 3:
+        return required - 1
+
+    if kind in {"combat_stat", "spell_hits"} and required >= 5:
+        reduction = max(1, round(required * 0.10))
+        return max(1, required - reduction)
+
+    return required
+
+
 def evaluate_spell_requirements(player, spell_key):
     spell = SPELLS[spell_key]
     requirements = spell.get("requirements", {})
@@ -396,30 +508,46 @@ def evaluate_spell_requirements(player, spell_key):
         current = player["level"]
         results.append((current >= required, f"Level {required} ({current}/{required})"))
 
-    for required_spell, required_level in requirements.get("spell_levels", {}).items():
+    for required_spell, base_required_level in requirements.get("spell_levels", {}).items():
+        required_level = ravenclaw_requirement(player, "spell_level", base_required_level)
         current = player["spell_levels"].get(required_spell, 0)
         display = SPELLS[required_spell]["display_name"]
-        results.append((current >= required_level, f"{display} Spell Level {required_level} ({current}/{required_level})"))
+        results.append((
+            current >= required_level,
+            f"{display} Spell Level {required_level} ({current}/{required_level})"
+        ))
 
-    for stat_name, required_value in requirements.get("min_stats", {}).items():
+    for stat_name, base_required_value in requirements.get("min_stats", {}).items():
+        required_value = ravenclaw_requirement(player, "min_stat", base_required_value)
         current = player["stats"].get(stat_name, 0)
         display = STAT_DISPLAY_NAMES.get(stat_name, stat_name)
-        results.append((current >= required_value, f"{display} {required_value} ({current}/{required_value})"))
+        results.append((
+            current >= required_value,
+            f"{display} {required_value} ({current}/{required_value})"
+        ))
 
     if "duel_wins" in requirements:
-        required = requirements["duel_wins"]
+        required = ravenclaw_requirement(player, "duel_wins", requirements["duel_wins"])
         current = player["duel_wins"]
         results.append((current >= required, f"Win {required} Duels ({current}/{required})"))
 
-    for stat_name, required_value in requirements.get("combat_stats", {}).items():
+    for stat_name, base_required_value in requirements.get("combat_stats", {}).items():
+        required_value = ravenclaw_requirement(player, "combat_stat", base_required_value)
         current = player["combat_stats"].get(stat_name, 0)
         display = COMBAT_STAT_DISPLAY_NAMES.get(stat_name, stat_name)
-        results.append((current >= required_value, f"{display}: {required_value} ({current}/{required_value})"))
+        results.append((
+            current >= required_value,
+            f"{display}: {required_value} ({current}/{required_value})"
+        ))
 
-    for required_spell, required_hits in requirements.get("spell_hits", {}).items():
+    for required_spell, base_required_hits in requirements.get("spell_hits", {}).items():
+        required_hits = ravenclaw_requirement(player, "spell_hits", base_required_hits)
         current = player["spell_hits"].get(required_spell, 0)
         display = SPELLS[required_spell]["display_name"]
-        results.append((current >= required_hits, f"Land {display} {required_hits} times ({current}/{required_hits})"))
+        results.append((
+            current >= required_hits,
+            f"Land {display} {required_hits} times ({current}/{required_hits})"
+        ))
 
     for required_spell in requirements.get("required_spells", []):
         display = SPELLS[required_spell]["display_name"]
@@ -572,13 +700,15 @@ async def check_duel_end(ctx, loser):
     if winner_leveled_up:
         await ctx.send(
             f"🌟 **{winner.display_name} reached "
-            f"Level {winner_player['level']}!**"
+            f"Level {winner_player['level']}!**\n"
+            f"🎯 Talent Points were awarded for the new Level."
         )
 
     if loser_leveled_up:
         await ctx.send(
             f"🌟 **{loser.display_name} reached "
-            f"Level {loser_player['level']}!**"
+            f"Level {loser_player['level']}!**\n"
+            f"🎯 Talent Points were awarded for the new Level."
         )
 
     # Clean Duel state
@@ -704,12 +834,10 @@ async def apply_attack(ctx, defender_user, attack):
             return
 
         # Apply the disarm if the opponent survives
-        status_effects[
-            defender_user.id
-        ] = {
-            "unarmed_until":
-                time.time() + duration
-        }
+        status_effects.setdefault(
+            defender_user.id,
+            {}
+        )["unarmed_until"] = time.time() + duration
 
         await ctx.send(
             f"⚡ **Expelliarmus hits "
@@ -719,6 +847,38 @@ async def apply_attack(ctx, defender_user, attack):
             f"is unarmed for **{duration} seconds**!\n"
             f"❤️ HP: "
             f"**{defender['hp']}/{defender['max_hp']}**"
+        )
+
+    elif spell == "stupefy":
+        damage = attack["damage"]
+        duration = attack["duration"]
+        defender["hp"] = max(0, defender["hp"] - damage)
+
+        attacker["combat_stats"]["successful_attacks"] += 1
+        attacker["combat_stats"]["successful_control_spells"] += 1
+        attacker["spell_hits"]["stupefy"] += 1
+
+        gain_player_xp(attacker, 10)
+        gain_spell_xp(attacker, "stupefy", 15)
+
+        if defender["hp"] <= 0:
+            await ctx.send(
+                f"🔴 **Stupefy hits {defender_user.display_name}!**\n"
+                f"💥 Damage: **{damage}**\n"
+                f"❤️ HP: **0/{defender['max_hp']}**"
+            )
+            await check_duel_end(ctx, defender_user)
+            return
+
+        status_effects.setdefault(defender_user.id, {})["stunned_until"] = (
+            time.time() + duration
+        )
+
+        await ctx.send(
+            f"🔴 **Stupefy hits {defender_user.display_name}!**\n"
+            f"💥 Damage: **{damage}**\n"
+            f"💫 {defender_user.display_name} is stunned for **{duration} seconds**!\n"
+            f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
         )
 
     elif spell == "sectumsempra":
@@ -765,6 +925,12 @@ async def launch_attack(
     duration=0,
     base_cooldown=6,
 ):
+    if is_stunned(ctx.author.id):
+        await ctx.send(
+            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+        )
+        return
+
     if ctx.author.id in active_casts:
         await ctx.send("⏳ Your previous spell has not been resolved yet.")
         return
@@ -1064,9 +1230,15 @@ async def spell_info(ctx, *, spell_name: str):
             lines.append(f"{'✅' if met else '❌'} {text}")
 
         quiz_rule = QUIZ_RULES[spell["difficulty"]]
+        quiz_required = quiz_rule["required_score"]
+        if player.get("house") == "ravenclaw":
+            quiz_required = max(1, quiz_required - 1)
+
         lines.append(
-            f"\n🧠 Knowledge Trial: **{quiz_rule['required_score']}/{quiz_rule['questions']} required**"
+            f"\n🧠 Knowledge Trial: **{quiz_required}/{quiz_rule['questions']} required**"
         )
+        if player.get("house") == "ravenclaw":
+            lines.append("🦅 Ravenclaw learning bonus applied.")
 
     if spell_key == "avadakedavra" and spell_key in player["learned_spells"]:
         remaining = max(0, 5 - player["duels_since_avada"])
@@ -1128,6 +1300,10 @@ async def learn(ctx, *, spell_name: str):
     quiz_rule = QUIZ_RULES[difficulty]
     required_score = quiz_rule["required_score"]
 
+    ravenclaw_bonus = player.get("house") == "ravenclaw"
+    if ravenclaw_bonus:
+        required_score = max(1, required_score - 1)
+
     teacher_key = (ctx.author.id, spell_key)
     teacher_used = False
     if teacher_key in teacher_help:
@@ -1155,13 +1331,23 @@ async def learn(ctx, *, spell_name: str):
         "teacher_used": teacher_used,
     }
 
-    teacher_text = "\n👨‍🏫 Teacher bonus active: required score reduced by 1." if teacher_used else ""
+    ravenclaw_text = (
+        "\n🦅 Ravenclaw bonus active: required score reduced by 1."
+        if ravenclaw_bonus
+        else ""
+    )
+    teacher_text = (
+        "\n👨‍🏫 Teacher bonus active: required score reduced by 1."
+        if teacher_used
+        else ""
+    )
 
     await ctx.send(
         f"📘 **{spell['display_name']} — Learning Trial**\n"
         f"Difficulty: **{stars(difficulty)}**\n"
         f"Questions: **{len(questions)}**\n"
         f"Required Score: **{required_score}/{len(questions)}**"
+        f"{ravenclaw_text}"
         f"{teacher_text}"
     )
 
@@ -1383,7 +1569,8 @@ async def confringo(ctx):
         return
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
-    damage = random.randint(15, 30)
+    spell_level = player["spell_levels"]["confringo"]
+    damage = random.randint(15, 30) + (spell_level - 1) * 3
     power = calculate_spell_power(player, "confringo")
     accuracy = calculate_spell_accuracy(player, "confringo")
 
@@ -1442,6 +1629,12 @@ async def avadakedavra(ctx):
         return
 
     player = get_player(ctx.author)
+
+    if is_stunned(ctx.author.id):
+        await ctx.send(
+            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+        )
+        return
 
     if not knows_spell(player, "avadakedavra"):
         await ctx.send("🔒 You have not learned **Avada Kedavra** yet.")
@@ -1511,6 +1704,12 @@ async def protego(ctx):
         await ctx.send("🛡️ There is no Attack to block.")
         return
 
+    if is_stunned(ctx.author.id):
+        await ctx.send(
+            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+        )
+        return
+
     defender = get_player(ctx.author)
     attack = pending_attacks[ctx.author.id]
     defense_power = calculate_protego_power(defender)
@@ -1543,6 +1742,12 @@ async def protego(ctx):
 async def dodge(ctx):
     if ctx.author.id not in pending_attacks:
         await ctx.send("💨 There is no Attack to Dodge.")
+        return
+
+    if is_stunned(ctx.author.id):
+        await ctx.send(
+            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+        )
         return
 
     defender = get_player(ctx.author)
@@ -1579,6 +1784,12 @@ async def expelliarmus(ctx):
 
     player = get_player(ctx.author)
 
+    if is_stunned(ctx.author.id):
+        await ctx.send(
+            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+        )
+        return
+
     if is_unarmed(ctx.author.id):
         await ctx.send(
             f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
@@ -1596,9 +1807,10 @@ async def expelliarmus(ctx):
         finish_attack(incoming_attack)
 
         if expelliarmus_power >= incoming_attack["power"]:
-            status_effects[attacker_id] = {
-                "unarmed_until": time.time() + 4
-            }
+            status_effects.setdefault(
+                attacker_id,
+                {}
+            )["unarmed_until"] = time.time() + 4
             player["combat_stats"]["successful_counters"] += 1
 
             await ctx.send(
@@ -1668,7 +1880,48 @@ async def not_yet_modeled_spell(ctx, spell_key):
 
 @bot.command()
 async def stupefy(ctx):
-    await not_yet_modeled_spell(ctx, "stupefy")
+    if ctx.author.id not in active_duels:
+        await ctx.send("You are not currently in a Duel.")
+        return
+
+    player = get_player(ctx.author)
+
+    if not knows_spell(player, "stupefy"):
+        await ctx.send("🔒 You have not learned **Stupefy** yet.")
+        return
+
+    if is_stunned(ctx.author.id):
+        await ctx.send(
+            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+        )
+        return
+
+    if is_unarmed(ctx.author.id):
+        await ctx.send(
+            f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
+        )
+        return
+
+    if ctx.author.id in pending_attacks:
+        await ctx.send("⚠️ You must react to the incoming Attack first.")
+        return
+
+    opponent = await bot.fetch_user(active_duels[ctx.author.id])
+    spell_level = player["spell_levels"]["stupefy"]
+    damage = random.randint(4, 8) + (spell_level - 1)
+    power = calculate_spell_power(player, "stupefy")
+    accuracy = calculate_spell_accuracy(player, "stupefy")
+
+    await launch_attack(
+        ctx,
+        opponent,
+        "stupefy",
+        power,
+        accuracy,
+        damage=damage,
+        duration=2,
+        base_cooldown=6,
+    )
 
 
 @bot.command()
@@ -1714,416 +1967,323 @@ async def arresto_momentum(ctx):
 # OWNER / ADMIN COMMANDS
 # =========================================================
 
+def owner_only(ctx):
+    return is_owner(ctx.author)
 
 
 @bot.command()
-async def setstat(
-        ctx,
-        target: discord.Member,
-        stat_name: str,
-        value: int
-):
-
-    if not is_owner(ctx.author):
-        await ctx.send(
-            "❌ You are not allowed to use this command."
-        )
+async def setstat(ctx, target: discord.Member, stat_name: str, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
         return
 
     player = get_player(target)
+    stat_name = stat_name.lower().replace("magicpower", "magic_power")
 
-    stat_name = stat_name.lower()
-
-    if stat_name == "magicpower":
-        stat_name = "magic_power"
-
-    valid_stats = {
-        "endurance",
-        "magic_power",
-        "speed",
-        "agility"
-    }
-
-    if stat_name not in valid_stats:
-        await ctx.send(
-            "❌ Invalid stat."
-        )
+    if stat_name not in STAT_DISPLAY_NAMES:
+        await ctx.send("❌ Invalid stat.")
         return
 
-    player["stats"][stat_name] = value
+    player["stats"][stat_name] = max(0, value)
 
     if stat_name == "endurance":
-
         update_max_hp(player)
-
-        if player["hp"] > player["max_hp"]:
-            player["hp"] = player["max_hp"]
+        player["hp"] = min(player["hp"], player["max_hp"])
 
     persist_player(player)
-
-    display_name = (
-        stat_name
-        .replace("_", " ")
-        .title()
-    )
 
     await ctx.send(
         f"✅ {target.display_name}'s "
-        f"{display_name} was set to "
-        f"**{value}**."
+        f"{STAT_DISPLAY_NAMES[stat_name]} was set to **{player['stats'][stat_name]}**."
     )
-
-    @bot.command()
-    async def addspell(
-            ctx,
-            target: discord.Member,
-            spell_name: str
-    ):
-
-        if not is_owner(ctx.author):
-            await ctx.send(
-                "❌ You are not allowed to use this command."
-            )
-            return
-
-        spell_name = spell_name.lower()
-
-        if spell_name not in SPELLS:
-            await ctx.send(
-                "❌ Unknown spell."
-            )
-            return
-
-        player = get_player(target)
-
-        player["learned_spells"].add(
-            spell_name
-        )
-
-        player["spell_levels"][spell_name] = max(
-            1,
-            player["spell_levels"].get(
-                spell_name,
-                0
-            )
-        )
-
-        player["spell_xp"].setdefault(
-            spell_name,
-            0
-        )
-
-        persist_player(player)
-
-        await ctx.send(
-            f"✅ {SPELLS[spell_name]['display_name']} "
-            f"was added to "
-            f"{target.display_name}."
-        )
-
-        @bot.command()
-        async def addspell(
-                ctx,
-                target: discord.Member,
-                spell_name: str
-        ):
-
-            if not is_owner(ctx.author):
-                await ctx.send(
-                    "❌ You are not allowed to use this command."
-                )
-                return
-
-            spell_name = spell_name.lower()
-
-            if spell_name not in SPELLS:
-                await ctx.send(
-                    "❌ Unknown spell."
-                )
-                return
-
-            player = get_player(target)
-
-            player["learned_spells"].add(
-                spell_name
-            )
-
-            player["spell_levels"][spell_name] = max(
-                1,
-                player["spell_levels"].get(
-                    spell_name,
-                    0
-                )
-            )
-
-            player["spell_xp"].setdefault(
-                spell_name,
-                0
-            )
-
-            persist_player(player)
-
-            await ctx.send(
-                f"✅ {SPELLS[spell_name]['display_name']} "
-                f"was added to "
-                f"{target.display_name}."
-            )
-
-            @bot.command()
-            async def setlevel(
-                    ctx,
-                    target: discord.Member,
-                    value: int
-            ):
-
-                if not is_owner(ctx.author):
-                    await ctx.send(
-                        "❌ You are not allowed to use this command."
-                    )
-                    return
-
-                if value < 1:
-                    await ctx.send(
-                        "❌ Level must be at least 1."
-                    )
-                    return
-
-                player = get_player(target)
-
-                player["level"] = value
-                player["xp"] = (
-                                       value - 1
-                               ) * 100
-
-                persist_player(player)
-
-                await ctx.send(
-                    f"✅ {target.display_name} "
-                    f"is now Level **{value}**."
-                )
 
 
 @bot.command()
-async def setxp(
-        ctx,
-        target: discord.Member,
-        value: int
-):
+async def addspell(ctx, target: discord.Member, *, spell_name: str):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
 
-    if not is_owner(ctx.author):
-        await ctx.send(
-            "❌ You are not allowed to use this command."
-        )
+    spell_name = normalize_spell_name(spell_name)
+    if spell_name not in SPELLS:
+        await ctx.send("❌ Unknown spell.")
         return
 
     player = get_player(target)
-
-    player["xp"] = max(
-        0,
-        value
-    )
-
-    update_player_level(player)
-
+    player["learned_spells"].add(spell_name)
+    player["spell_levels"][spell_name] = max(1, player["spell_levels"].get(spell_name, 0))
+    player["spell_xp"].setdefault(spell_name, 0)
+    player["spell_hits"].setdefault(spell_name, 0)
     persist_player(player)
 
     await ctx.send(
-        f"✅ {target.display_name}'s XP "
-        f"was set to **{player['xp']}**."
+        f"✅ {SPELLS[spell_name]['display_name']} was added to {target.display_name}."
     )
 
 
 @bot.command()
-async def addxp(
-        ctx,
-        target: discord.Member,
-        amount: int
-):
+async def removespell(ctx, target: discord.Member, *, spell_name: str):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
 
-    if not is_owner(ctx.author):
-        await ctx.send(
-            "❌ You are not allowed to use this command."
-        )
+    spell_name = normalize_spell_name(spell_name)
+    if spell_name not in SPELLS:
+        await ctx.send("❌ Unknown spell.")
+        return
+
+    if spell_name in STARTING_SPELLS:
+        await ctx.send("❌ Starting Spells are automatically restored and cannot be removed.")
         return
 
     player = get_player(target)
-
-    gain_player_xp(
-        player,
-        amount
-    )
+    player["learned_spells"].discard(spell_name)
+    player["spell_levels"][spell_name] = 0
+    player["spell_xp"][spell_name] = 0
+    player["spell_hits"][spell_name] = 0
+    persist_player(player)
 
     await ctx.send(
-        f"✅ Added **{amount} XP** to "
-        f"{target.display_name}."
+        f"✅ {SPELLS[spell_name]['display_name']} was removed from {target.display_name}."
     )
 
-@bot.command()
-async def setspelllevel(
-        ctx,
-        target: discord.Member,
-        spell_name: str,
-        level: int
-):
 
-    if not is_owner(ctx.author):
-        await ctx.send(
-            "❌ You are not allowed to use this command."
-        )
+@bot.command()
+async def setlevel(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
         return
 
-    spell_name = spell_name.lower()
+    if value < 1:
+        await ctx.send("❌ Level must be at least 1.")
+        return
 
-    if spell_name not in SPELLS:
-        await ctx.send(
-            "❌ Unknown spell."
+    player = get_player(target)
+    player["level"] = value
+    player["xp"] = (value - 1) * 100
+    persist_player(player)
+    await ctx.send(f"✅ {target.display_name} is now Level **{value}**.")
+
+
+@bot.command()
+async def setxp(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    player["xp"] = max(0, value)
+    update_player_level(player)
+    persist_player(player)
+
+    await ctx.send(
+        f"✅ {target.display_name}'s XP was set to **{player['xp']}** "
+        f"(Level {player['level']})."
+    )
+
+
+@bot.command()
+async def addxp(ctx, target: discord.Member, amount: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    old_level = player["level"]
+    old_points = player["talent_points"]
+    gain_player_xp(player, amount)
+    gained_points = player["talent_points"] - old_points
+
+    message = f"✅ Added **{amount} XP** to {target.display_name}."
+    if player["level"] > old_level:
+        message += (
+            f"\n🌟 Level {old_level} → **{player['level']}**"
+            f"\n🎯 +**{gained_points} Talent Points**"
         )
+    await ctx.send(message)
+
+
+@bot.command()
+async def setspelllevel(ctx, target: discord.Member, spell_name: str, level: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    spell_name = normalize_spell_name(spell_name)
+    if spell_name not in SPELLS:
+        await ctx.send("❌ Unknown spell.")
         return
 
     if level < 1:
-        await ctx.send(
-            "❌ Spell Level must be at least 1."
-        )
+        await ctx.send("❌ Spell Level must be at least 1.")
         return
 
     player = get_player(target)
-
-    player["learned_spells"].add(
-        spell_name
-    )
-
+    player["learned_spells"].add(spell_name)
     player["spell_levels"][spell_name] = level
-
-    player["spell_xp"][spell_name] = (
-        level - 1
-    ) * 100
-
+    player["spell_xp"][spell_name] = (level - 1) * 100
     persist_player(player)
 
     await ctx.send(
-        f"✅ {target.display_name}'s "
-        f"{SPELLS[spell_name]['display_name']} "
+        f"✅ {target.display_name}'s {SPELLS[spell_name]['display_name']} "
         f"is now Spell Level **{level}**."
     )
 
 
 @bot.command()
-async def settpoints(
-        ctx,
-        target: discord.Member,
-        value: int
-):
+async def setspellxp(ctx, target: discord.Member, spell_name: str, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
 
-    if not is_owner(ctx.author):
-        await ctx.send(
-            "❌ You are not allowed to use this command."
-        )
+    spell_name = normalize_spell_name(spell_name)
+    if spell_name not in SPELLS:
+        await ctx.send("❌ Unknown spell.")
         return
 
     player = get_player(target)
-
-    player["talent_points"] = max(
-        0,
-        value
-    )
-
+    player["learned_spells"].add(spell_name)
+    player["spell_xp"][spell_name] = max(0, value)
+    player["spell_levels"][spell_name] = max(1, 1 + player["spell_xp"][spell_name] // 100)
     persist_player(player)
 
     await ctx.send(
-        f"✅ {target.display_name} now has "
-        f"**{player['talent_points']} Talent Points**."
+        f"✅ {target.display_name}'s {SPELLS[spell_name]['display_name']} XP is now "
+        f"**{player['spell_xp'][spell_name]}** "
+        f"(Spell Level {player['spell_levels'][spell_name]})."
     )
 
-    @bot.command()
-    async def sethouse(
-            ctx,
-            target: discord.Member,
-            house_name: str
-    ):
 
-        if not is_owner(ctx.author):
-            await ctx.send(
-                "❌ You are not allowed to use this command."
-            )
-            return
+@bot.command(name="setpoints", aliases=["settpoints"])
+async def setpoints(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
 
-        house_name = house_name.lower()
+    player = get_player(target)
+    player["talent_points"] = max(0, value)
+    persist_player(player)
+    await ctx.send(
+        f"✅ {target.display_name} now has **{player['talent_points']} Talent Points**."
+    )
 
-        if house_name not in HOUSE_STATS:
-            await ctx.send(
-                "❌ Unknown House."
-            )
-            return
-
-        player = get_player(target)
-
-        player["house"] = house_name
-        player["profile_started"] = True
-        player["ready"] = True
-
-        player["stats"] = (
-            HOUSE_STATS[
-                house_name
-            ].copy()
-        )
-
-        update_max_hp(player)
-
-        player["hp"] = (
-            player["max_hp"]
-        )
-
-        persist_player(player)
-
-        await ctx.send(
-            f"✅ {target.display_name} was moved to "
-            f"**{HOUSE_NAMES[house_name]}**."
-        )
 
 @bot.command()
-async def sethouse(
-        ctx,
-        target: discord.Member,
-        house_name: str
-):
+async def addpoints(ctx, target: discord.Member, amount: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
 
-    if not is_owner(ctx.author):
-        await ctx.send(
-            "❌ You are not allowed to use this command."
-        )
+    player = get_player(target)
+    player["talent_points"] = max(0, player["talent_points"] + amount)
+    persist_player(player)
+    await ctx.send(
+        f"✅ {target.display_name} now has **{player['talent_points']} Talent Points**."
+    )
+
+
+@bot.command()
+async def sethouse(ctx, target: discord.Member, house_name: str):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
         return
 
     house_name = house_name.lower()
-
     if house_name not in HOUSE_STATS:
-        await ctx.send(
-            "❌ Unknown House."
-        )
+        await ctx.send("❌ Unknown House.")
         return
 
     player = get_player(target)
-
     player["house"] = house_name
     player["profile_started"] = True
     player["ready"] = True
-
-    player["stats"] = (
-        HOUSE_STATS[
-            house_name
-        ].copy()
-    )
-
+    player["stats"] = HOUSE_STATS[house_name].copy()
     update_max_hp(player)
-
-    player["hp"] = (
-        player["max_hp"]
-    )
-
+    player["hp"] = player["max_hp"]
     persist_player(player)
 
     await ctx.send(
-        f"✅ {target.display_name} was moved to "
-        f"**{HOUSE_NAMES[house_name]}**."
+        f"✅ {target.display_name} was moved to **{HOUSE_NAMES[house_name]}**."
+    )
+
+
+@bot.command()
+async def sethp(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    player["hp"] = max(0, min(value, player["max_hp"]))
+    persist_player(player)
+    await ctx.send(
+        f"✅ {target.display_name}'s HP is now **{player['hp']}/{player['max_hp']}**."
+    )
+
+
+@bot.command()
+async def setmaxhp(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    player["max_hp"] = max(1, value)
+    player["hp"] = min(player["hp"], player["max_hp"])
+    persist_player(player)
+    await ctx.send(
+        f"✅ {target.display_name}'s Max HP is now **{player['max_hp']}**."
+    )
+
+
+@bot.command()
+async def setwins(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    player["duel_wins"] = max(0, value)
+    persist_player(player)
+    await ctx.send(f"✅ Wins set to **{player['duel_wins']}**.")
+
+
+@bot.command()
+async def setlosses(ctx, target: discord.Member, value: int):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    player["duel_losses"] = max(0, value)
+    persist_player(player)
+    await ctx.send(f"✅ Losses set to **{player['duel_losses']}**.")
+
+
+@bot.command()
+async def adminprofile(ctx, target: discord.Member):
+    if not owner_only(ctx):
+        await ctx.send("❌ You are not allowed to use this command.")
+        return
+
+    player = get_player(target)
+    spells_text = ", ".join(
+        f"{SPELLS[key]['display_name']} L{player['spell_levels'].get(key, 0)}"
+        for key in sorted(player["learned_spells"], key=lambda k: SPELLS[k]["display_name"])
+    )
+
+    await ctx.send(
+        f"🔐 **ADMIN PROFILE — {target.display_name}**\n"
+        f"House: **{player['house']}**\n"
+        f"Level: **{player['level']}** | XP: **{player['xp']}**\n"
+        f"HP: **{player['hp']}/{player['max_hp']}**\n"
+        f"Talent Points: **{player['talent_points']}**\n"
+        f"Stats: `{player['stats']}`\n"
+        f"Wins: **{player['duel_wins']}** | Losses: **{player['duel_losses']}** | "
+        f"Completed: **{player['duels_completed']}**\n"
+        f"Avada progress: **{player['duels_since_avada']}/5**\n"
+        f"Combat Stats: `{player['combat_stats']}`\n"
+        f"Spells: {spells_text}"
     )
 
 
