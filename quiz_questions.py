@@ -93,9 +93,7 @@ QUIZ_QUESTIONS = [
         "answers": ["Acromantula", "Basilisk", "Hippogriff", "Thestral"],
         "correct": "Acromantula",
         "difficulty": 2,
-        "category": "creatures",        "correct": "Reparo",
-        "difficulty": 3,
-        "category": "spells",
+        "category": "creatures",
     },
 
     # =====================================================
@@ -203,4 +201,8 @@ QUIZ_QUESTIONS = [
         "difficulty": 5,
         "category": "history",
     },
+
+    {"question": "Which spell repairs broken objects?", "answers": ["Reparo", "Lumos", "Nox", "Accio"], "correct": "Reparo", "difficulty": 3, "category": "spells"},
+    {"question": "Which spell summons objects?", "answers": ["Accio", "Depulso", "Protego", "Obliviate"], "correct": "Accio", "difficulty": 3, "category": "spells"},
+    {"question": "Which spell unlocks doors?", "answers": ["Alohomora", "Lumos", "Stupefy", "Incendio"], "correct": "Alohomora", "difficulty": 3, "category": "spells"},
 ]

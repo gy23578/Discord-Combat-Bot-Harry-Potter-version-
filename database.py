@@ -1,8 +1,10 @@
 import sqlite3
 import json
+from contextlib import closing
+from pathlib import Path
 
 
-DATABASE_FILE = "players.db"
+DATABASE_FILE = str(Path(__file__).with_name("players.db"))
 
 
 def init_database():
@@ -72,3 +74,19 @@ def load_player(user_id):
     )
 
     return player
+
+def save_runtime(state):
+    """Store resumable sessions separately from permanent player progression."""
+    with closing(sqlite3.connect(DATABASE_FILE)) as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS runtime (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+        connection.execute("INSERT INTO runtime VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (json.dumps(state),))
+        connection.commit()
+
+
+def load_runtime():
+    with closing(sqlite3.connect(DATABASE_FILE)) as connection:
+        exists = connection.execute("SELECT 1 FROM sqlite_master WHERE name='runtime'").fetchone()
+        if not exists:
+            return None
+        row = connection.execute("SELECT data FROM runtime WHERE id=1").fetchone()
+    return json.loads(row[0]) if row else None

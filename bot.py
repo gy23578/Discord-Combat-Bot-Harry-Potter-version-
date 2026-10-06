@@ -2,7 +2,10 @@ import asyncio
 import os
 import random
 import time
-from database import init_database, save_player, load_player
+import logging
+import uuid
+from combat import MODELED_SPELLS, CURSE_MIN_ROLLS, PROTEGO_DAMAGE_PERCENT, roll_offensive_effect, choose_forced_spell
+from database import init_database, save_player, load_player, save_runtime, load_runtime
 
 import discord
 from discord.ext import commands
@@ -18,13 +21,15 @@ from spells import QUIZ_RULES, SPELLS, STARTING_SPELLS
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = int(os.getenv("BOT_OWNER_ID"))
+try:
+    OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
+except ValueError:
+    OWNER_ID = 0
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-init_database()
 
 
 # =========================================================
@@ -93,14 +98,14 @@ SPELL_SPEEDS = {
     "protego": 0,
     "expelliarmus": 9,
     "stupefy": 8,
-    "incendio": 6,
-    "levioso": 7,
+    "incendio": 9,
     "diffindo": 8,
     "depulso": 7,
     "glacius": 6,
     "petrificustotalus": 5,
     "bombarda": 4,
-    "arrestomomentum": 6,
+    "endoloris": 7,
+    "impero": 7,
     "sectumsempra": 6,
     "avadakedavra": 8,
 }
@@ -119,12 +124,57 @@ active_casts = set()
 offensive_cooldowns = {}
 active_learning_trials = {}
 teacher_help = {}
+duel_sessions = {}
+DUEL_REQUEST_TTL = 120
+logger = logging.getLogger(__name__)
+runtime_restored = False
+SPELL_RENAMES = {"doloris": "endoloris", "imperio": "impero"}
 
 
 # =========================================================
 # HELPERS
 # =========================================================
 
+
+
+def persist_runtime():
+    save_runtime({
+        "duel_requests": duel_requests, "active_duels": active_duels,
+        "duel_sessions": duel_sessions, "status_effects": status_effects,
+        "offensive_cooldowns": offensive_cooldowns,
+        "active_learning_trials": active_learning_trials,
+        "teacher_help": [[student, spell, teacher] for (student, spell), teacher in teacher_help.items()],
+    })
+
+
+def restore_runtime():
+    state = load_runtime()
+    if state is None:
+        return []
+    for name in ("duel_requests", "active_duels", "duel_sessions", "status_effects",
+                 "offensive_cooldowns", "active_learning_trials"):
+        globals()[name].update({int(key): value for key, value in state.get(name, {}).items()})
+    for student, spell, teacher in state.get("teacher_help", []):
+        spell = SPELL_RENAMES.get(spell, spell)
+        if spell in SPELLS:
+            teacher_help[(student, spell)] = teacher
+    for user_id, trial in list(active_learning_trials.items()):
+        if trial["spell"] in SPELL_RENAMES:
+            trial["spell"] = SPELL_RENAMES[trial["spell"]]
+            trial["display_name"] = SPELLS[trial["spell"]]["display_name"]
+        if trial["spell"] not in SPELLS:
+            active_learning_trials.pop(user_id)
+    # Keep both users pointing at the same session object for end-of-duel locking.
+    for uid, opponent in active_duels.items():
+        if uid in duel_sessions and opponent in duel_sessions:
+            duel_sessions[opponent] = duel_sessions[uid]
+            duel_sessions[uid].pop("ending", None)
+    return sorted({session["channel_id"] for session in duel_sessions.values()})
+
+
+@bot.event
+async def on_command_completion(ctx):
+    persist_runtime()
 
 
 def is_owner(user):
@@ -243,6 +293,7 @@ def get_player(user):
     )
 
     player = players[user.id]
+    before_migration = repr(player)
 
     # Lightweight migration for older saved profiles.
     player.setdefault("profile_started", False)
@@ -269,6 +320,23 @@ def get_player(user):
     player.setdefault("spell_levels", {})
     player.setdefault("spell_xp", {})
     player.setdefault("spell_hits", {})
+
+    # Preserve progression when loading profiles saved under former names.
+    for old_name, new_name in SPELL_RENAMES.items():
+        if old_name in player["learned_spells"]:
+            player["learned_spells"].remove(old_name)
+            player["learned_spells"].add(new_name)
+        for field in ("spell_levels", "spell_xp", "spell_hits"):
+            if old_name in player[field]:
+                player[field][new_name] = max(
+                    player[field].get(new_name, 0), player[field].pop(old_name)
+                )
+
+    # Prune retired spell data without touching unrelated player progression.
+    player["learned_spells"].intersection_update(SPELLS)
+    for field in ("spell_levels", "spell_xp", "spell_hits"):
+        for spell_key in set(player[field]) - SPELLS.keys():
+            player[field].pop(spell_key)
 
     for spell_key in SPELLS:
         player["spell_levels"].setdefault(
@@ -302,8 +370,8 @@ def get_player(user):
                 0
             )
 
-    persist_player(player)
-
+    if repr(player) != before_migration:
+        persist_player(player)
     return player
 
 
@@ -417,7 +485,7 @@ def start_cooldown(user_id, duration):
 
 
 def calculate_cooldown(player, base_cooldown):
-    speed = player["stats"]["speed"]
+    speed = effective_speed(player)
     modifier = (speed - 15) * 0.12
     cooldown = base_cooldown - modifier
 
@@ -451,7 +519,7 @@ def calculate_protego_power(player):
 
 
 def calculate_spell_accuracy(player, spell_name):
-    player_speed = player["stats"]["speed"]
+    player_speed = effective_speed(player)
     spell_level = player["spell_levels"][spell_name]
     spell_speed = SPELL_SPEEDS.get(spell_name, 6)
 
@@ -468,9 +536,33 @@ def calculate_dodge_power(player):
     return random.randint(1, 20) + agility + player["level"] * 2
 
 
+def effective_speed(player):
+    effects = status_effects.get(player["user_id"], {})
+    penalty = effects.get("speed_penalty", 0) if time.time() < effects.get("slowed_until", 0) else 0
+    return max(0, player["stats"]["speed"] - penalty)
+
+
+def session_is_current(user_id, session_id):
+    return duel_sessions.get(user_id, {}).get("id") == session_id and user_id in active_duels
+
+
+def in_duel_channel(ctx):
+    session = duel_sessions.get(ctx.author.id)
+    return session is None or session["channel_id"] == ctx.channel.id
+
+
+@bot.check
+async def check_duel_channel(ctx):
+    if not in_duel_channel(ctx):
+        await ctx.send("Continue your Duel in the channel where it was accepted.")
+        return False
+    return True
+
+
 def finish_attack(attack):
     attacker_id = attack["attacker_id"]
-    active_casts.discard(attacker_id)
+    if not any(pending["attacker_id"] == attacker_id for pending in pending_attacks.values()):
+        active_casts.discard(attacker_id)
     start_cooldown(attacker_id, attack["cooldown"])
 
 
@@ -658,6 +750,11 @@ async def check_duel_end(ctx, loser):
 
     loser_player["hp"] = 0
 
+    session = duel_sessions.get(loser.id)
+    if session is None or session.get("ending"):
+        return False
+    session["ending"] = True
+
     winner_id = active_duels.get(loser.id)
 
     if winner_id is None:
@@ -713,24 +810,27 @@ async def check_duel_end(ctx, loser):
 
     # Clean Duel state
     for user_id in (loser.id, winner_id):
+        duel_sessions.pop(user_id, None)
         active_duels.pop(user_id, None)
         pending_attacks.pop(user_id, None)
         active_casts.discard(user_id)
         status_effects.pop(user_id, None)
         offensive_cooldowns.pop(user_id, None)
 
+    persist_runtime()
     return True
 
 
-async def apply_sectumsempra_bleed(ctx, defender_user, attacker_user):
+async def apply_sectumsempra_bleed(ctx, defender_user, attacker_user, session_id):
     for delay in (3, 3):
         await asyncio.sleep(delay)
 
-        if defender_user.id not in active_duels:
+        if not session_is_current(defender_user.id, session_id):
             return
 
         defender = get_player(defender_user)
         defender["hp"] = max(0, defender["hp"] - 5)
+        persist_player(defender)
 
         await ctx.send(
             f"🩸 **Sectumsempra bleeding deals 5 damage to {defender_user.display_name}.**\n"
@@ -756,6 +856,7 @@ async def apply_sectumsempra_backlash(ctx, attack, defense_power):
     attacker = get_player(attacker_user)
     backlash = random.randint(5, 10)
     attacker["hp"] = max(0, attacker["hp"] - backlash)
+    persist_player(attacker)
 
     await ctx.send(
         f"🩸 **Sectumsempra backfires!**\n"
@@ -768,9 +869,13 @@ async def apply_sectumsempra_backlash(ctx, attack, defense_power):
 
 async def apply_attack(ctx, defender_user, attack):
     defender = get_player(defender_user)
+    if not session_is_current(defender_user.id, attack["session_id"]):
+        return
     spell = attack["spell"]
     attacker_id = attack["attacker_id"]
     attacker_user = await bot.fetch_user(attacker_id)
+    if not session_is_current(defender_user.id, attack["session_id"]):
+        return
     attacker = get_player(attacker_user)
 
     if spell == "confringo":
@@ -804,6 +909,8 @@ async def apply_attack(ctx, defender_user, attack):
 
         attacker["combat_stats"]["successful_attacks"] += 1
         attacker["spell_hits"]["expelliarmus"] += 1
+
+        persist_player(defender)
 
         gain_player_xp(
             attacker,
@@ -858,6 +965,7 @@ async def apply_attack(ctx, defender_user, attack):
         attacker["combat_stats"]["successful_control_spells"] += 1
         attacker["spell_hits"]["stupefy"] += 1
 
+        persist_player(defender)
         gain_player_xp(attacker, 10)
         gain_spell_xp(attacker, "stupefy", 15)
 
@@ -899,7 +1007,7 @@ async def apply_attack(ctx, defender_user, attack):
 
         if not await check_duel_end(ctx, defender_user):
             asyncio.create_task(
-                apply_sectumsempra_bleed(ctx, defender_user, attacker_user)
+                apply_sectumsempra_bleed(ctx, defender_user, attacker_user, attack["session_id"])
             )
 
     elif spell == "avadakedavra":
@@ -914,6 +1022,74 @@ async def apply_attack(ctx, defender_user, attack):
         gain_spell_xp(attacker, "avadakedavra", 25)
         await check_duel_end(ctx, defender_user)
 
+    elif spell in {"endoloris", "impero"}:
+        attacker["combat_stats"]["successful_attacks"] += 1
+        attacker["combat_stats"]["successful_control_spells"] += 1
+        attacker["spell_hits"][spell] += 1
+        gain_player_xp(attacker, 15)
+        gain_spell_xp(attacker, spell, 15)
+        if spell == "endoloris":
+            hit_time = time.monotonic()
+            await ctx.send(f"⚡ **Endoloris afflicts {defender_user.display_name}!** No immediate damage; 10 damage at 3s, 6s, and 9s.")
+            asyncio.create_task(apply_endoloris(ctx, defender_user, attack["session_id"], hit_time))
+        else:
+            forced_spell = choose_forced_spell(defender)
+            if forced_spell is None:
+                await ctx.send("Impero finds no eligible offensive spell.")
+                return
+            effect = roll_offensive_effect(forced_spell, defender["spell_levels"][forced_spell])
+            await queue_attack(ctx, defender_user, defender_user, forced_spell,
+                               calculate_spell_power(defender, forced_spell),
+                               calculate_spell_accuracy(defender, forced_spell),
+                               forced=True, session_id=attack["session_id"], **effect)
+
+    elif spell in MODELED_SPELLS:
+        defender["hp"] = max(0, defender["hp"] - attack["damage"])
+        attacker["combat_stats"]["successful_attacks"] += 1
+        attacker["spell_hits"][spell] += 1
+        effects = status_effects.setdefault(defender_user.id, {})
+        if spell in {"depulso", "petrificustotalus"}:
+            effects["stunned_until"] = max(effects.get("stunned_until", 0), time.time() + attack["duration"])
+            attacker["combat_stats"]["successful_control_spells"] += 1
+        if spell == "glacius":
+            effects["slowed_until"] = time.time() + attack["duration"]
+            effects["speed_penalty"] = 5
+            attacker["combat_stats"]["successful_control_spells"] += 1
+        gain_player_xp(attacker, 15)
+        gain_spell_xp(attacker, spell, 15)
+        await ctx.send(f"{SPELLS[spell]['emoji']} **{SPELLS[spell]['display_name']} hits!** Damage: **{attack['damage']}**. HP: **{defender['hp']}/{defender['max_hp']}**")
+        if not await check_duel_end(ctx, defender_user) and spell == "incendio":
+            asyncio.create_task(apply_burn(ctx, defender_user, attack["session_id"]))
+
+    persist_player(defender)
+
+
+async def apply_burn(ctx, defender_user, session_id):
+    for _ in range(2):
+        await asyncio.sleep(3)
+        if not session_is_current(defender_user.id, session_id):
+            return
+        defender = get_player(defender_user)
+        defender["hp"] = max(0, defender["hp"] - 3)
+        persist_player(defender)
+        await ctx.send(f"🔥 Burn deals **3 damage** to {defender_user.display_name}.")
+        if await check_duel_end(ctx, defender_user):
+            return
+
+
+async def apply_endoloris(ctx, defender_user, session_id, hit_time=None):
+    hit_time = time.monotonic() if hit_time is None else hit_time
+    for offset in (3, 6, 9):
+        await asyncio.sleep(max(0, hit_time + offset - time.monotonic()))
+        if not session_is_current(defender_user.id, session_id):
+            return
+        defender = get_player(defender_user)
+        defender["hp"] = max(0, defender["hp"] - 10)
+        persist_player(defender)
+        await ctx.send(f"⚡ **Endoloris deals 10 damage to {defender_user.display_name}.** HP: **{defender['hp']}/{defender['max_hp']}**")
+        if await check_duel_end(ctx, defender_user):
+            return
+
 
 async def launch_attack(
     ctx,
@@ -925,6 +1101,9 @@ async def launch_attack(
     duration=0,
     base_cooldown=6,
 ):
+    if active_duels.get(ctx.author.id) != opponent.id or not in_duel_channel(ctx):
+        await ctx.send("This Duel is no longer available here.")
+        return
     if is_stunned(ctx.author.id):
         await ctx.send(
             f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
@@ -948,25 +1127,42 @@ async def launch_attack(
         )
         return
 
-    attacker_player = get_player(ctx.author)
+    await queue_attack(ctx, ctx.author, opponent, spell_name, power, accuracy,
+                       damage=damage, duration=duration, base_cooldown=base_cooldown,
+                       session_id=duel_sessions[ctx.author.id]["id"])
+
+
+async def queue_attack(ctx, caster, opponent, spell_name, power, accuracy,
+                       damage=0, duration=0, base_cooldown=6, forced=False,
+                       session_id=None):
+    """Share pending-attack creation/timing; forced casts bypass voluntary gates."""
+    if not session_is_current(opponent.id, session_id) or opponent.id in pending_attacks:
+        return
+    attacker_player = get_player(caster)
     cooldown = calculate_cooldown(attacker_player, base_cooldown)
-
-    active_casts.add(ctx.author.id)
+    if spell_name in CURSE_MIN_ROLLS and random.randint(1, 6) < CURSE_MIN_ROLLS[spell_name]:
+        start_cooldown(caster.id, cooldown)
+        persist_runtime()
+        await ctx.send("❌ **Spell missed.**")
+        return
+    active_casts.add(caster.id)
     attack_id = time.time_ns()
-
     pending_attacks[opponent.id] = {
         "id": attack_id,
-        "attacker_id": ctx.author.id,
+        "session_id": session_id,
+        "attacker_id": caster.id,
         "spell": spell_name,
         "power": power,
         "accuracy": accuracy,
         "damage": damage,
         "duration": duration,
         "cooldown": cooldown,
+        "forced": forced,
     }
-
+    persist_runtime()
+    verb = "is compelled by Impero to cast" if forced else "casts"
     await ctx.send(
-        f"🪄 **{ctx.author.display_name} casts {SPELLS[spell_name]['display_name'].upper()} at {opponent.display_name}!**\n"
+        f"🪄 **{caster.display_name} {verb} {SPELLS[spell_name]['display_name'].upper()} at {opponent.display_name}!**\n"
         f"⏳ {opponent.display_name} has **10 seconds** to react.\n"
         f"Reactions: `!protego`, `!expelliarmus`, or `!dodge`."
     )
@@ -977,7 +1173,7 @@ async def launch_attack(
         return
 
     current_attack = pending_attacks[opponent.id]
-    if current_attack["id"] != attack_id:
+    if current_attack["id"] != attack_id or not session_is_current(opponent.id, current_attack["session_id"]):
         return
 
     del pending_attacks[opponent.id]
@@ -988,6 +1184,7 @@ async def launch_attack(
     )
 
     await apply_attack(ctx, opponent, current_attack)
+    persist_runtime()
 
 
 # =========================================================
@@ -996,6 +1193,15 @@ async def launch_attack(
 
 @bot.event
 async def on_ready():
+    global runtime_restored
+    if not runtime_restored:
+        channels = restore_runtime()
+        runtime_restored = True
+        for channel_id in channels:
+            channel = bot.get_channel(channel_id)
+            if channel is not None:
+                await channel.send("The bot restarted. Your Duel is restored; interrupted spells and remaining burn/bleed/curse ticks were cancelled. You can continue casting.")
+        persist_runtime()
     print(f"Connected as {bot.user}")
 
 
@@ -1491,7 +1697,7 @@ async def duel(ctx, target: discord.Member):
         await ctx.send("One of you is already in a Duel.")
         return
 
-    duel_requests[target.id] = ctx.author.id
+    duel_requests[target.id] = {"challenger_id": ctx.author.id, "expires": time.time() + DUEL_REQUEST_TTL, "channel_id": ctx.channel.id}
     await ctx.send(
         f"⚔️ **{ctx.author.display_name} challenges {target.display_name} to a Duel!**\n"
         f"{target.display_name}, use `!accept` or `!decline`."
@@ -1504,7 +1710,7 @@ async def decline(ctx):
         await ctx.send("You have no Duel request.")
         return
 
-    challenger_id = duel_requests.pop(ctx.author.id)
+    challenger_id = duel_requests.pop(ctx.author.id)["challenger_id"]
     challenger = await bot.fetch_user(challenger_id)
 
     await ctx.send(
@@ -1518,7 +1724,33 @@ async def accept(ctx):
         await ctx.send("You have no Duel request.")
         return
 
-    challenger_id = duel_requests.pop(ctx.author.id)
+    request = duel_requests[ctx.author.id]
+    challenger_id = request["challenger_id"]
+    if time.time() >= request["expires"]:
+        duel_requests.pop(ctx.author.id)
+        await ctx.send("This Duel request has expired. Ask for a new challenge.")
+        return
+    if ctx.channel.id != request["channel_id"]:
+        await ctx.send("Accept the challenge in the channel where it was sent.")
+        return
+    if ctx.author.id in active_duels or challenger_id in active_duels:
+        duel_requests.pop(ctx.author.id)
+        await ctx.send("One of you is already in a Duel.")
+        return
+    challenger = await bot.fetch_user(challenger_id)
+    player1 = get_player(challenger)
+    player2 = get_player(ctx.author)
+    if not player1["ready"] or not player2["ready"]:
+        await ctx.send("Both players must finish their profiles first.")
+        return
+    # Reserve the session without awaiting between validation and mutation.
+    if ctx.author.id in active_duels or challenger_id in active_duels:
+        await ctx.send("One of you is already in a Duel.")
+        return
+    duel_requests.pop(ctx.author.id)
+    session = {"id": uuid.uuid4().hex, "channel_id": ctx.channel.id}
+    duel_sessions[ctx.author.id] = session
+    duel_sessions[challenger_id] = session
     active_duels[ctx.author.id] = challenger_id
     active_duels[challenger_id] = ctx.author.id
 
@@ -1528,6 +1760,8 @@ async def accept(ctx):
 
     player1["hp"] = player1["max_hp"]
     player2["hp"] = player2["max_hp"]
+    persist_player(player1)
+    persist_player(player2)
 
     for user_id in (challenger_id, ctx.author.id):
         pending_attacks.pop(user_id, None)
@@ -1570,7 +1804,7 @@ async def confringo(ctx):
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
     spell_level = player["spell_levels"]["confringo"]
-    damage = random.randint(15, 30) + (spell_level - 1) * 3
+    damage = roll_offensive_effect("confringo", spell_level)["damage"]
     power = calculate_spell_power(player, "confringo")
     accuracy = calculate_spell_accuracy(player, "confringo")
 
@@ -1607,7 +1841,7 @@ async def sectumsempra(ctx):
         return
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
-    damage = random.randint(30, 45)
+    damage = roll_offensive_effect("sectumsempra", player["spell_levels"]["sectumsempra"])["damage"]
     power = calculate_spell_power(player, "sectumsempra")
     accuracy = calculate_spell_accuracy(player, "sectumsempra")
 
@@ -1675,9 +1909,15 @@ async def avadakedavra(ctx):
         )
         return
 
+    if active_duels.get(ctx.author.id) != opponent.id:
+        await ctx.send("This Duel has ended.")
+        return
+
     # The attempt is consumed immediately, hit or miss.
     player["duels_since_avada"] = 0
     persist_player(player)
+
+    persist_runtime()
 
     # Hidden 1d6 roll: 5-6 succeeds, 1-4 misses.
     if random.randint(1, 6) < 5:
@@ -1722,11 +1962,22 @@ async def protego(ctx):
         gain_player_xp(defender, 5)
         gain_spell_xp(defender, "protego", 10)
 
-        await ctx.send(
-            f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
-            f"✨ The Attack is blocked!\n"
-
-        )
+        chip = attack.get("damage", 0) * PROTEGO_DAMAGE_PERCENT.get(attack["spell"], 0) // 100
+        if chip:
+            defender["hp"] = max(0, defender["hp"] - chip)
+            persist_player(defender)
+            await ctx.send(
+                f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
+                f"✨ Most of the Attack is blocked, but **{chip} damage** gets through!\n"
+                f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
+            )
+            if await check_duel_end(ctx, ctx.author):
+                return
+        else:
+            await ctx.send(
+                f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
+                f"✨ The Attack is blocked!\n"
+            )
 
         await apply_sectumsempra_backlash(ctx, attack, defense_power)
     else:
@@ -1842,10 +2093,7 @@ async def expelliarmus(ctx):
 
     spell_level = player["spell_levels"]["expelliarmus"]
 
-    damage = (
-            random.randint(3, 7)
-            + (spell_level - 1)
-    )
+    damage = roll_offensive_effect("expelliarmus", spell_level)["damage"]
 
     await launch_attack(
         ctx,
@@ -1860,22 +2108,29 @@ async def expelliarmus(ctx):
 
 
 # =========================================================
-# NOT-YET-MODELED COMBAT SPELLS
-# They can be learned now. Their exact combat effects will be
-# added once we lock their numbers/mechanics together.
+# ADDITIONAL COMBAT SPELLS
+# Numeric tuning is maintained in combat.py.
 # =========================================================
 
-async def not_yet_modeled_spell(ctx, spell_key):
+async def modeled_spell(ctx, spell_key):
     player = get_player(ctx.author)
-    spell = SPELLS[spell_key]
-
     if spell_key not in player["learned_spells"]:
-        await ctx.send(f"🔒 You have not learned **{spell['display_name']}** yet.")
+        await ctx.send(f"🔒 You have not learned **{SPELLS[spell_key]['display_name']}** yet.")
         return
-
-    await ctx.send(
-        f"📘 **{spell['display_name']} is learned, but its combat effect has not been modeled yet.**"
-    )
+    if ctx.author.id not in active_duels:
+        await ctx.send("You are not currently in a Duel.")
+        return
+    if is_unarmed(ctx.author.id):
+        await ctx.send("You are unarmed.")
+        return
+    if ctx.author.id in pending_attacks:
+        await ctx.send("React to the incoming Attack first.")
+        return
+    opponent = await bot.fetch_user(active_duels[ctx.author.id])
+    effect = roll_offensive_effect(spell_key, player["spell_levels"][spell_key])
+    await launch_attack(ctx, opponent, spell_key,
+                        calculate_spell_power(player, spell_key),
+                        calculate_spell_accuracy(player, spell_key), **effect)
 
 
 @bot.command()
@@ -1908,7 +2163,7 @@ async def stupefy(ctx):
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
     spell_level = player["spell_levels"]["stupefy"]
-    damage = random.randint(4, 8) + (spell_level - 1)
+    damage = roll_offensive_effect("stupefy", spell_level)["damage"]
     power = calculate_spell_power(player, "stupefy")
     accuracy = calculate_spell_accuracy(player, "stupefy")
 
@@ -1926,42 +2181,44 @@ async def stupefy(ctx):
 
 @bot.command()
 async def incendio(ctx):
-    await not_yet_modeled_spell(ctx, "incendio")
-
-
-@bot.command()
-async def levioso(ctx):
-    await not_yet_modeled_spell(ctx, "levioso")
+    await modeled_spell(ctx, "incendio")
 
 
 @bot.command()
 async def diffindo(ctx):
-    await not_yet_modeled_spell(ctx, "diffindo")
+    await modeled_spell(ctx, "diffindo")
 
 
 @bot.command()
 async def depulso(ctx):
-    await not_yet_modeled_spell(ctx, "depulso")
+    await modeled_spell(ctx, "depulso")
 
 
 @bot.command()
 async def glacius(ctx):
-    await not_yet_modeled_spell(ctx, "glacius")
+    await modeled_spell(ctx, "glacius")
 
 
 @bot.command(name="petrificustotalus")
 async def petrificus_totalus(ctx):
-    await not_yet_modeled_spell(ctx, "petrificustotalus")
+    await modeled_spell(ctx, "petrificustotalus")
 
 
 @bot.command()
 async def bombarda(ctx):
-    await not_yet_modeled_spell(ctx, "bombarda")
+    await modeled_spell(ctx, "bombarda")
 
 
-@bot.command(name="arrestomomentum")
-async def arresto_momentum(ctx):
-    await not_yet_modeled_spell(ctx, "arrestomomentum")
+
+@bot.command()
+async def endoloris(ctx):
+    await modeled_spell(ctx, "endoloris")
+
+
+@bot.command()
+async def impero(ctx):
+    await modeled_spell(ctx, "impero")
+
 
 # =========================================================
 # OWNER / ADMIN COMMANDS
@@ -1971,12 +2228,16 @@ def owner_only(ctx):
     return is_owner(ctx.author)
 
 
-@bot.command()
-async def setstat(ctx, target: discord.Member, stat_name: str, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
+async def owner_check(ctx):
+    if owner_only(ctx):
+        return True
+    await ctx.send("❌ You are not allowed to use this command.")
+    return False
 
+
+@bot.command()
+@commands.check(owner_check)
+async def setstat(ctx, target: discord.Member, stat_name: str, value: int):
     player = get_player(target)
     stat_name = stat_name.lower().replace("magicpower", "magic_power")
 
@@ -1999,11 +2260,8 @@ async def setstat(ctx, target: discord.Member, stat_name: str, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def addspell(ctx, target: discord.Member, *, spell_name: str):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     spell_name = normalize_spell_name(spell_name)
     if spell_name not in SPELLS:
         await ctx.send("❌ Unknown spell.")
@@ -2022,11 +2280,8 @@ async def addspell(ctx, target: discord.Member, *, spell_name: str):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def removespell(ctx, target: discord.Member, *, spell_name: str):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     spell_name = normalize_spell_name(spell_name)
     if spell_name not in SPELLS:
         await ctx.send("❌ Unknown spell.")
@@ -2049,11 +2304,8 @@ async def removespell(ctx, target: discord.Member, *, spell_name: str):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setlevel(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     if value < 1:
         await ctx.send("❌ Level must be at least 1.")
         return
@@ -2066,11 +2318,8 @@ async def setlevel(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setxp(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["xp"] = max(0, value)
     update_player_level(player)
@@ -2083,11 +2332,8 @@ async def setxp(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def addxp(ctx, target: discord.Member, amount: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     old_level = player["level"]
     old_points = player["talent_points"]
@@ -2104,11 +2350,8 @@ async def addxp(ctx, target: discord.Member, amount: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setspelllevel(ctx, target: discord.Member, spell_name: str, level: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     spell_name = normalize_spell_name(spell_name)
     if spell_name not in SPELLS:
         await ctx.send("❌ Unknown spell.")
@@ -2131,11 +2374,8 @@ async def setspelllevel(ctx, target: discord.Member, spell_name: str, level: int
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setspellxp(ctx, target: discord.Member, spell_name: str, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     spell_name = normalize_spell_name(spell_name)
     if spell_name not in SPELLS:
         await ctx.send("❌ Unknown spell.")
@@ -2155,11 +2395,8 @@ async def setspellxp(ctx, target: discord.Member, spell_name: str, value: int):
 
 
 @bot.command(name="setpoints", aliases=["settpoints"])
+@commands.check(owner_check)
 async def setpoints(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["talent_points"] = max(0, value)
     persist_player(player)
@@ -2169,11 +2406,8 @@ async def setpoints(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def addpoints(ctx, target: discord.Member, amount: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["talent_points"] = max(0, player["talent_points"] + amount)
     persist_player(player)
@@ -2183,11 +2417,8 @@ async def addpoints(ctx, target: discord.Member, amount: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def sethouse(ctx, target: discord.Member, house_name: str):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     house_name = house_name.lower()
     if house_name not in HOUSE_STATS:
         await ctx.send("❌ Unknown House.")
@@ -2208,11 +2439,8 @@ async def sethouse(ctx, target: discord.Member, house_name: str):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def sethp(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["hp"] = max(0, min(value, player["max_hp"]))
     persist_player(player)
@@ -2222,11 +2450,8 @@ async def sethp(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setmaxhp(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["max_hp"] = max(1, value)
     player["hp"] = min(player["hp"], player["max_hp"])
@@ -2237,11 +2462,8 @@ async def setmaxhp(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setwins(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["duel_wins"] = max(0, value)
     persist_player(player)
@@ -2249,11 +2471,8 @@ async def setwins(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def setlosses(ctx, target: discord.Member, value: int):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     player["duel_losses"] = max(0, value)
     persist_player(player)
@@ -2261,11 +2480,8 @@ async def setlosses(ctx, target: discord.Member, value: int):
 
 
 @bot.command()
+@commands.check(owner_check)
 async def adminprofile(ctx, target: discord.Member):
-    if not owner_only(ctx):
-        await ctx.send("❌ You are not allowed to use this command.")
-        return
-
     player = get_player(target)
     spells_text = ", ".join(
         f"{SPELLS[key]['display_name']} L{player['spell_levels'].get(key, 0)}"
@@ -2291,4 +2507,22 @@ async def adminprofile(ctx, target: discord.Member):
 # START BOT
 # =========================================================
 
-bot.run(TOKEN)
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CheckFailure):
+        return
+    if isinstance(error, commands.UserInputError):
+        await ctx.send(f"Invalid command arguments. Use `!help {ctx.command}` for usage.")
+        return
+    logger.error("Command failed", exc_info=(type(error), error, error.__traceback__))
+    await ctx.send("The command could not be completed. Please try again.")
+
+
+if __name__ == "__main__":
+    if not TOKEN or OWNER_ID <= 0:
+        raise SystemExit("Set DISCORD_TOKEN and a valid BOT_OWNER_ID in .env before starting.")
+    logging.basicConfig(level=logging.INFO)
+    init_database()
+    bot.run(TOKEN)
