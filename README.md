@@ -14,7 +14,7 @@ The bot validates configuration before connecting. Importing the module for test
 - `combat.py`: Discord-independent numeric tuning for the additional spells.
 - `spells.py`: Spell metadata, prerequisites, and quiz thresholds.
 - `quiz_questions.py`: Multiple-choice question bank.
-- `database.py`: SQLite JSON player storage and resumable runtime snapshots.
+- `database.py`: SQLite JSON player storage, atomic writes, health checks, and safe online backups.
 
 Players begin with `!profile`, choose a house with `!house`, and spend three talent points with `!train`. Challenge another ready player with `!duel @player`; requests expire after two minutes. Accept and continue the duel in the challenge channel. Players are identified globally by Discord user ID, so each player can participate in only one duel across servers.
 
@@ -51,17 +51,47 @@ Impero itself causes no direct damage. Its victim's highest-level learned offens
 
 The forced payload uses the victim's stats, spell level, spell speed, damage formula, effects, and ordinary offensive recovery. It bypasses voluntary casting gates (cooldown, stun, disarm, and existing cast) because it is compelled. It creates a normal pending attack against that same victim, with a fresh 10-second reaction window. Normal defense eligibility and rolls apply: Protego, Expelliarmus, or Dodge. A successful self-counter disarms the victim, and Sectumsempra backlash affects the victim, because they are the payload's caster. Spell hits and XP follow existing caster attribution; the original Impero caster receives the curse's hit/control credit, and the victim receives any ordinary forced-payload casting credit. Fatal self-damage awards the duel to the other participant through normal duel completion.
 
-Retired spells are pruned from saved learned spells, spell levels, spell XP, and hit counters when profiles are loaded. Retired learning trials and teaching bonuses are discarded during runtime restoration. Talent points and unrelated profile data are preserved.
+Retired spells are pruned from saved learned spells, spell levels, spell XP, and hit counters when profiles are loaded. Live learning trials are discarded at restart. Talent points and unrelated profile data are preserved.
+
+## Normal duel inactivity
+
+A normal PvP duel ends after **300 consecutive seconds** without an accepted player combat action. Both participants share one last-activity timestamp and one scheduled deadline. Valid offensive attempts (including a failed initial curse roll), Protego, Dodge, and Expelliarmus counters reset the deadline, even when a defense roll fails. Unavailable/invalid casts, unrelated commands, ordinary Discord messages, delayed damage ticks, and automatically forced self-casts do not reset it.
+
+At the deadline the duel ends without a winner or loser. Each player loses 10 XP, clamped at zero; player Level is recalculated and may decrease, while existing Talent Points are kept. Wins, losses, completed duels, Avada recharge counters, and normal completion rewards are unchanged. Both players return to their current maximum HP. Pending attacks, active casts, cooldowns, statuses, and the scheduled timer are cleared; delayed combat work is invalidated by the old session identifier. The duel channel receives an inactivity announcement.
+
+A valid action accepted **before** the deadline postpones expiration. At or after the deadline, new actions are rejected and timeout cleanup proceeds. Cleanup claims the session and applies penalties without yielding, so competing callbacks cannot penalize the same duel twice. A normal victory stops its timer. Each simultaneous duel has its own deadline, and Training Duels have no inactivity timer or XP penalty.
+
+Inactivity is tracked only in memory. Restart expires live sessions without rewards or penalties; an ordinary gateway reconnect preserves live sessions and their existing deadlines.
+
+## Cooperative Training Duels
+
+A teacher offers `!teach @student <spell>`, or a student requests `!askhelp @teacher <spell>`. In either direction the roles remain teacher and student; the other player answers `!accept` or `!decline` in the request channel. Requests expire after two minutes. Only one teaching request can involve a player at a time, and pending normal duel requests must be resolved first. The original normal `!duel`, `!accept`, and `!decline` flow remains available. If both kinds of requests exist in an old/ambiguous inbox, use `!accept training` or `!accept duel` (likewise for `!decline`).
+
+The teacher must know the target spell at Spell Level 3 or above. The student must not know it yet. Both characters must be ready, free of active combat and Knowledge Trials, and available in the request server. The student must already meet all non-practical prerequisites: player Level, minimum stats, required learned spells, prerequisite Spell Levels, normal duel wins, and any requirement to learn all other spells. These checks run when requesting and again on acceptance.
+
+Training uses the existing combat engine, spell mechanics, cooldowns, and reactions in the request channel. Participants start at full HP and return to their pre-training HP when it ends. `!training` displays current objectives. Either player can use `!canceltraining` from any channel to leave or cancel a pending teaching request.
+
+Objectives are generated only from unmet `spell_hits` and `combat_stats` requirements. The remaining target subtracts the student's permanent progress and uses the student's Ravenclaw adjustments. Example: an ordinary five-hit requirement with two existing hits becomes three training hits. Requirements already satisfied through normal play or saved training are omitted. Spells with no outstanding practical objectives use the existing Knowledge Trial directly and do not create an empty training session.
+
+Each objective tracks teacher and student contributions separately. Combined contributions must reach its target, and the student must personally succeed at least once in **each** objective. One Confringo hit can correctly advance both its specific hit objective and a successful-attack objective once each. Unrelated players and sessions cannot contribute. Progress summaries appear after relevant successful actions; completed objectives do not accumulate further live counts.
+
+Training grants no player XP, spell XP, spell levels, Talent Points, permanent combat stats, permanent spell hits, duel wins/losses, duel completion counts, or normal duel rewards. The teacher's actions never increase the student's lifetime counters. Avada Kedavra keeps its usual availability check, initial roll, and combat behavior, but training attempts do not consume or recharge its completed-duel availability. Owner/admin progression commands remain available.
+
+An objective is saved to the student's `practical_training` profile field as soon as its numeric target and personal-contribution rule are both met. Full completion saves the spell's practical certificate, ends training, and makes the ordinary `!learn <spell>` Knowledge Trial available, provided non-practical prerequisites are still met. It does **not** teach the spell automatically or reduce the quiz passing score. Quiz difficulty and Ravenclaw's quiz bonus remain unchanged. The former one-answer teaching discount has been removed.
+
+Cancellation, zero HP, detected server departure, channel deletion, bot removal from the server, or a command failure safely ends training. Completed objectives remain saved and are omitted on a subsequent session; incomplete live counts reset. Restart also discards the live session and pending teaching requests, preserving completed objectives/certificates and pre-training HP. Delayed effects and pending attacks from an ended session cannot affect a later duel.
+
+Offline status or a Discord client disconnect is not reliably detectable with the current intents. Server-departure cleanup runs when Discord delivers member-removal events; receiving these may require enabling the Members intent in the deployment. No additional privileged intents are enabled by this feature. Use `!canceltraining` when leaving voluntarily.
 
 ## Persistence and restart behavior
 
-Player profiles and HP are saved in SQLite. Runtime snapshots preserve duel participants and channel, challenges, learning progress, teaching bonuses, statuses, and offensive cooldowns. Commands save snapshots when completed; launching an attack also saves before its reaction timer.
+Permanent profiles/progression and completed practical objectives/certificates use the existing JSON `players` table. The absolute database path is always `players.db` beside `database.py`, including when launched from another directory. Existing records receive missing defaults and legacy spell-name migrations when loaded; corrupt records are logged and refused rather than replaced. WAL, FULL synchronization, a bounded five-second busy timeout, and transaction-managed connections protect writes. Both profiles are written in one transaction for normal duel results and inactivity penalties.
 
-On restart, duels and quizzes resume. In-flight attacks and remaining burn/bleed/curse ticks are cancelled, and restored duel channels receive a notice. Already-applied damage remains. Status and cooldown timestamps continue to expire during downtime. Delayed damage checks a unique duel identifier, preventing effects from leaking into a subsequent duel.
+Live duels, teaching/challenge requests, attacks, casts, statuses, cooldowns, and Knowledge Trials are memory-only. On startup, legacy runtime snapshots are cleared; no combat resumes and no restart XP penalty/reward is given. Training stores pre-session HP, not training damage. New duels always start at full HP. Normal HP already saved before a hard crash can remain visible in profiles until the next duel; it cannot resume damage/status effects. Completed learning/training progression remains saved. A gateway reconnect is not a restart and does not erase live sessions.
 
-Runtime snapshots and individual profile saves are separate transactions; they do not provide atomic recovery from a crash during a command. Run one bot process per database. SQLite operations are synchronous and intended for this small bot's workload.
+Delayed tasks are tracked by unique session ID, validate current sessions, and are cancelled on combat end. Cleanup occurs before duel-result announcements, so Discord send failures cannot strand completed duels or award them twice. SIGINT/SIGTERM abort active sessions without rewards/penalties, restore HP, and cancel background work. A process lock prevents duplicate launches from this application directory. Run exactly one instance; copies in different directories still need operator coordination.
 
-Owner commands use a shared authorization check against `BOT_OWNER_ID`. Invalid arguments receive usage guidance; unexpected failures are logged and receive a short Discord error response.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration, backups, permissions, hosting, and remaining limitations. No gameplay balance values changed for deployment preparation.
 
 ## Tests
 
