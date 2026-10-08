@@ -2837,6 +2837,44 @@ async def owner_check(ctx):
 
 @bot.command()
 @commands.check(owner_check)
+async def servers(ctx):
+    guilds = list(bot.guilds)
+    if not guilds:
+        await ctx.send("Duellium is not currently in any servers.")
+        return
+
+    message = "DUELLIUM SERVERS\n\n"
+    for index, guild in enumerate(guilds, start=1):
+        name = discord.utils.escape_markdown(" ".join(guild.name.split()))
+        members = guild.member_count if guild.member_count is not None else "Unknown"
+        entry = f"{index}. {name}\n   ID: {guild.id}\n   Members: {members}\n\n"
+        if len(message) + len(entry) > 2000:
+            await ctx.send(message)
+            message = ""
+        message += entry
+
+    total = f"Total servers: {len(guilds)}"
+    if len(message) + len(total) > 2000:
+        await ctx.send(message)
+        message = ""
+    await ctx.send(message + total)
+
+
+@bot.command()
+@commands.check(owner_check)
+async def leaveguild(ctx, guild_id: int):
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await ctx.send(f"Duellium is not currently in a server with ID {guild_id}.")
+        return
+
+    name = discord.utils.escape_markdown(" ".join(guild.name.split()))
+    await ctx.send(f"Leaving {name} (ID: {guild.id}).")
+    await guild.leave()
+
+
+@bot.command()
+@commands.check(owner_check)
 async def setstat(ctx, target: discord.Member, stat_name: str, value: int):
     player = get_player(target)
     stat_name = stat_name.lower().replace("magicpower", "magic_power")
@@ -3197,7 +3235,7 @@ async def capture_combat_session(ctx):
 
 @bot.check
 async def guild_context(ctx):
-    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test"}:
+    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test", "servers", "leaveguild"}:
         raise commands.NoPrivateMessage()
     return True
 
