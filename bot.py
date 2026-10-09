@@ -3267,7 +3267,7 @@ async def capture_combat_session(ctx):
 
 @bot.check
 async def guild_context(ctx):
-    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test", "globalleaderboard"}:
+    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test"}:
         raise commands.NoPrivateMessage()
     return True
 
