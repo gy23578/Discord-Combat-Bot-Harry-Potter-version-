@@ -26,13 +26,13 @@ These are initial balancing values. Spell levels above one add the listed damage
 
 | Spell | Direct damage | Per-level bonus | Effect | Base recovery |
 |---|---:|---:|---|---:|
-| Incendio | 10–18 | 2 | Spell Speed 9; two 3-damage burn ticks, three seconds apart | 6 seconds |
-| Diffindo | 18–28 | 3 | Spell Speed 8 pressures dodging | 6 seconds |
-| Depulso | 8–14 | 2 | Stun for 2 seconds | 6 seconds |
-| Glacius | 6–12 | 2 | Reduce Speed by 5 for 10 seconds | 6 seconds |
-| Petrificus Totalus | 0–3 | 1 | Stun for 4 seconds | 12 seconds |
-| Bombarda | 30–42 | 3 | Heavy direct damage; 25% passes successful Protego | 15 seconds |
-| Endoloris | 0 | 0 | 10 damage at 3s, 6s, and 9s after a hit | 15 seconds |
+| Incendio | 18–26 | 3 | Spell Speed 9; two 4-damage burn ticks, three seconds apart | 6 seconds |
+| Diffindo | 26–36 | 4 | Spell Speed 8 pressures dodging | 6 seconds |
+| Depulso | 15–22 | 3 | Stun for 2 seconds | 6 seconds |
+| Glacius | 12–18 | 3 | Reduce Speed by 5 for 10 seconds | 6 seconds |
+| Petrificus Totalus | 6–10 | 2 | Stun for 4 seconds | 12 seconds |
+| Bombarda | 38–52 | 4 | Heavy direct damage; 25% passes successful Protego | 15 seconds |
+| Endoloris | 0 | 0 | 14 damage at 3s, 6s, and 9s after a hit | 15 seconds |
 | Impero | 0 | 0 | Force the victim's highest-level eligible offensive spell against themselves | 15 seconds |
 
 Successful Protego blocks prevent spell effects, but Bombarda and Sectumsempra still deal 25% of their rolled direct damage, rounded down. This partial damage is saved and can end the duel normally. Sectumsempra bleeding is prevented, and its existing backlash remains if the defender survives. Successful Dodge and Expelliarmus counters still prevent all incoming damage. Partial damage alone does not grant attacker hit/XP credit; the defender keeps their successful-block credit. Avada Kedavra retains its existing one-third initial success chance, five-completed-duel availability, and ordinary defensive reactions.
@@ -96,3 +96,17 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for configuration, backups, permissions, host
 ## Tests
 
 Run `python -B -m unittest discover -s tests -v`. Tests use temporary databases and mocked Discord objects, without connecting to Discord or changing `players.db`.
+
+## Duellium rankings
+
+Every normal completed PvP duel is ranked; there is no casual mode. In the duel's server, the winner gains 10 player points, the loser loses up to 3 points (never below zero), and the winner's current stored House gains 10 House Points. The losing House loses nothing. Training, inactivity, cancellation, rejected challenges, and incomplete duels grant no ranking points. Existing XP and progression rewards are unchanged.
+
+- `!leaderboard`: current server's top 10 players; shows your local rank when outside the top 10.
+- `!globalleaderboard`: top 10 by the SQL sum of local points across all servers; shows your global rank when outside the top 10. Also works in DMs.
+- `!houseleaderboard`: the current server's four Houses, including zero-point Houses.
+
+Player ties use ascending Discord user ID; House ties use alphabetical House key order. Players without a ranked result are unranked with zero points. Names use guild/cache display names, then the saved global profile name, then a safe ID fallback. Looking at a leaderboard does not create or modify profiles or points. Guild-local commands require a server channel; the existing active-duel channel rule remains in force.
+
+SQLite adds `local_player_points` keyed by `(guild_id, user_id)`, `local_house_points` keyed by `(guild_id, house)`, and `ranked_duel_results` keyed by the unique duel session ID. Local player scores have indexed ordering and user lookup. Global totals are queried using `SUM(points) GROUP BY user_id`; no duplicate global total or global House score is stored. Normal duel completion saves existing profile rewards, both local player changes, House points, and the result receipt in one transaction. The in-memory ending guard and persistent unique receipt prevent repeat awards, including after restart. Backups automatically include these tables. Existing profiles are not duplicated per guild, migrated into rankings, or awarded retroactive points.
+
+To test with two accounts: finish both profiles, use `!duel @opponent` / `!accept`, and complete the combat normally. Check the local player and House boards. Reverse the winner to test the zero floor. Play in a second server to check local isolation and global sums; restart and check persistence. A five-minute inactive duel and a teaching/training session should leave all ranking scores unchanged. New migration tables are created on the next normal startup; the existing database is not wiped.

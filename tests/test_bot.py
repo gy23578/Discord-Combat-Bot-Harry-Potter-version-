@@ -209,10 +209,10 @@ class GameTests(unittest.IsolatedAsyncioTestCase):
 
     def test_shared_offensive_formulas_preserve_existing_scaling(self):
         cases = {
-            "confringo": (15, 30, 21, 0, 6),
-            "expelliarmus": (3, 7, 5, 4, 6),
-            "stupefy": (4, 8, 6, 2, 6),
-            "sectumsempra": (30, 45, 30, 0, 15),
+            "confringo": (24, 36, 32, 0, 6),
+            "expelliarmus": (8, 12, 12, 4, 6),
+            "stupefy": (10, 15, 14, 2, 6),
+            "sectumsempra": (40, 54, 48, 0, 15),
         }
         for spell, (low, high, damage, duration, cooldown) in cases.items():
             with patch("combat.random.randint", return_value=low) as roll:
@@ -243,17 +243,17 @@ class GameTests(unittest.IsolatedAsyncioTestCase):
 
         async def send(message):
             tick_times.append(clock[0])
-            self.assertEqual(database.load_player(2)["hp"], 100 - 10 * len(tick_times))
+            self.assertEqual(database.load_player(2)["hp"], 100 - 14 * len(tick_times))
             clock[0] += 0.25  # Message latency must not move subsequent deadlines.
 
         ctx.send.side_effect = send
         with patch.object(bot.time, "monotonic", side_effect=lambda: clock[0]), patch.object(bot.asyncio, "sleep", side_effect=sleep):
             await bot.apply_endoloris(ctx, user(2), "original", hit_time=0)
         self.assertEqual(tick_times, [3, 6, 9])
-        self.assertEqual(bot.players[2]["hp"], 70)
+        self.assertEqual(bot.players[2]["hp"], 58)
 
     async def test_each_endoloris_tick_can_end_duel_and_stops_later_ticks(self):
-        for hp, ticks in ((10, 1), (20, 2), (30, 3)):
+        for hp, ticks in ((14, 1), (28, 2), (42, 3)):
             self.session()
             bot.players[2]["hp"] = hp
             ctx = context()
@@ -291,7 +291,7 @@ class GameTests(unittest.IsolatedAsyncioTestCase):
         accuracy.assert_called_once_with(victim, "confringo")
         self.assertEqual(observed[0]["attacker_id"], 2)
         self.assertEqual(observed[0]["spell"], "confringo")
-        self.assertEqual(observed[0]["damage"], 32)
+        self.assertEqual(observed[0]["damage"], 36)
         self.assertEqual(observed[0]["power"], 42)
         self.assertEqual(observed[0]["accuracy"], 51)
         self.assertEqual(observed[0]["cooldown"], bot.calculate_cooldown(victim, 6))

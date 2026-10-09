@@ -970,6 +970,12 @@ async def check_duel_end(ctx, loser, session_id=None):
         20, persist=False
     )
 
+    ranking_eligible = (
+        session.get("mode", "normal") == "normal"
+        and winner_player["hp"] > 0
+        and active_duels.get(winner_id) == loser.id
+        and duel_sessions.get(winner_id, {}).get("id") == session["id"]
+    )
     # Claim and clear state even if persistence or Discord is unavailable.
     cancel_combat_tasks(session["id"])
     for user_id in (loser.id, winner_id):
@@ -977,7 +983,24 @@ async def check_duel_end(ctx, loser, session_id=None):
             state.pop(user_id, None)
         active_casts.discard(user_id)
     clear_participant_requests({loser.id, winner_id})
-    database.save_players([winner_player, loser_player])
+    guild_id = session.get("guild_id") or getattr(getattr(ctx, "guild", None), "id", None)
+    ranking_text = ""
+    if guild_id is not None and ranking_eligible:
+        ranking = database.save_ranked_duel_result(session["id"], guild_id, winner_player, loser_player)
+        if ranking is None:
+            return False
+        winner_before, winner_after = ranking["players"][winner_id]
+        loser_before, loser_after = ranking["players"][loser.id]
+        ranking_text = (
+            f"\n\n**SERVER POINTS**\n"
+            f"{winner.display_name}: {winner_before} → {winner_after} (+10)\n"
+            f"{loser.display_name}: {loser_before} → {loser_after} ({loser_after - loser_before:+d})"
+        )
+        if ranking["house"] is not None:
+            ranking_text += f"\n🏠 **{HOUSE_NAMES[ranking['house']]} +10 House Points**"
+    else:
+        # Missing guilds or states without a legitimate surviving winner earn no ranking points.
+        database.save_players([winner_player, loser_player])
     logger.info("Normal duel %s completed", session["id"])
 
     await ctx.send(
@@ -986,6 +1009,7 @@ async def check_duel_end(ctx, loser, session_id=None):
         f"❤️ {loser.display_name}: **0/{loser_player['max_hp']} HP**\n"
         f"⭐ {winner.display_name} earns **50 XP**.\n"
         f"⭐ {loser.display_name} earns **20 XP**."
+        + ranking_text
     )
 
     if winner_leveled_up:
@@ -1014,11 +1038,11 @@ async def apply_sectumsempra_bleed(ctx, defender_user, attacker_user, session_id
             return
 
         defender = get_player(defender_user)
-        defender["hp"] = max(0, defender["hp"] - 5)
+        defender["hp"] = max(0, defender["hp"] - 6)
         persist_player(defender)
 
         await ctx.send(
-            f"🩸 **Sectumsempra bleeding deals 5 damage to {defender_user.display_name}.**\n"
+            f"🩸 **Sectumsempra bleeding deals 6 damage to {defender_user.display_name}.**\n"
             f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
         )
 
@@ -1221,7 +1245,7 @@ async def apply_attack(ctx, defender_user, attack):
         gain_combat_spell_xp(attacker, spell, 15, training=training)
         if spell == "endoloris":
             hit_time = time.monotonic()
-            await ctx.send(f"⚡ **Endoloris afflicts {defender_user.display_name}!** No immediate damage; 10 damage at 3s, 6s, and 9s.")
+            await ctx.send(f"⚡ **Endoloris afflicts {defender_user.display_name}!** No immediate damage; 14 damage at 3s, 6s, and 9s.")
             spawn_combat_task(attack["session_id"], apply_endoloris(ctx, defender_user, attack["session_id"], hit_time))
         else:
             forced_spell = choose_forced_spell(defender)
@@ -1266,9 +1290,9 @@ async def apply_burn(ctx, defender_user, session_id):
         if not session_is_current(defender_user.id, session_id):
             return
         defender = get_player(defender_user)
-        defender["hp"] = max(0, defender["hp"] - 3)
+        defender["hp"] = max(0, defender["hp"] - 4)
         persist_player(defender)
-        await ctx.send(f"🔥 Burn deals **3 damage** to {defender_user.display_name}.")
+        await ctx.send(f"🔥 Burn deals **4 damage** to {defender_user.display_name}.")
         if await check_duel_end(ctx, defender_user, session_id):
             return
 
@@ -1280,9 +1304,9 @@ async def apply_endoloris(ctx, defender_user, session_id, hit_time=None):
         if not session_is_current(defender_user.id, session_id):
             return
         defender = get_player(defender_user)
-        defender["hp"] = max(0, defender["hp"] - 10)
+        defender["hp"] = max(0, defender["hp"] - 14)
         persist_player(defender)
-        await ctx.send(f"⚡ **Endoloris deals 10 damage to {defender_user.display_name}.** HP: **{defender['hp']}/{defender['max_hp']}**")
+        await ctx.send(f"⚡ **Endoloris deals 14 damage to {defender_user.display_name}.** HP: **{defender['hp']}/{defender['max_hp']}**")
         if await check_duel_end(ctx, defender_user, session_id):
             return
 
@@ -3107,6 +3131,52 @@ async def adminprofile(ctx, target: discord.Member):
 # START BOT
 # =========================================================
 
+def ranking_display_name(ctx, entry):
+    guild = getattr(ctx, "guild", None)
+    member = guild.get_member(entry["user_id"]) if guild else None
+    cached = member or bot.get_user(entry["user_id"])
+    name = getattr(cached, "display_name", None) or entry["name"] or f"Player {entry['user_id']}"
+    name = str(name).replace("\n", " ").replace("\r", " ")[:60]
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(name))
+
+
+async def send_player_leaderboard(ctx, global_points=False):
+    guild_id = None if global_points else ctx.guild.id
+    entries, personal = database.player_leaderboard(ctx.author.id, guild_id)
+    title = "🌍 **DUELLIUM GLOBAL LEADERBOARD**" if global_points else "🏆 **SERVER LEADERBOARD**"
+    lines = [title]
+    lines.extend(f"#{entry['rank']} {ranking_display_name(ctx, entry)} — {entry['points']} pts" for entry in entries)
+    if not entries:
+        lines.append("No ranked results yet.")
+    if personal is None:
+        lines.append("\nYour Global Rank: Unranked — 0 pts" if global_points else "\nYour Rank: Unranked — 0 pts")
+    elif personal[0] > 10:
+        label = "Your Global Rank" if global_points else "Your Rank"
+        lines.append(f"\n{label}: #{personal[0]} — {personal[1]} pts")
+    await ctx.send("\n".join(lines))
+
+
+@bot.command()
+@commands.guild_only()
+async def leaderboard(ctx):
+    await send_player_leaderboard(ctx)
+
+
+@bot.command()
+async def globalleaderboard(ctx):
+    await send_player_leaderboard(ctx, global_points=True)
+
+
+@bot.command()
+@commands.guild_only()
+async def houseleaderboard(ctx):
+    rows = database.house_leaderboard(ctx.guild.id)
+    lines = ["🏆 **HOUSE LEADERBOARD**"]
+    for medal, (house, points) in zip(("🥇", "🥈", "🥉", "4."), rows):
+        lines.append(f"{medal} {HOUSE_NAMES[house]} — {points} pts")
+    await ctx.send("\n".join(lines))
+
+
 @bot.command()
 @commands.check(owner_check)
 async def botstatus(ctx):
@@ -3197,7 +3267,7 @@ async def capture_combat_session(ctx):
 
 @bot.check
 async def guild_context(ctx):
-    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test"}:
+    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test", "globalleaderboard"}:
         raise commands.NoPrivateMessage()
     return True
 

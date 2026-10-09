@@ -158,7 +158,7 @@ SPELLS = {
             "combat_stats": {"successful_control_spells": 10},
             "duel_wins": 5,
         },
-        "description": "Initial d6 roll: 3–6 succeeds, 1–2 misses. No immediate damage. A hit causes 10 damage at 3, 6, and 9 seconds over a 10-second curse.",
+        "description": "Initial d6 roll: 3–6 succeeds, 1–2 misses. No immediate damage. A hit causes 14 damage at 3, 6, and 9 seconds over a 10-second curse.",
     },
     "impero": {
         "display_name": "Impero",
