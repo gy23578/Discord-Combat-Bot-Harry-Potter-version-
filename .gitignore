@@ -12,3 +12,6 @@ backups/
 *.db-wal
 *.db-shm
 .bot.lock
+players.db
+players.db-wal
+players.db-shm

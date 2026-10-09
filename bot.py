@@ -609,7 +609,7 @@ def in_duel_channel(ctx):
 
 @bot.check
 async def check_duel_channel(ctx):
-    if getattr(getattr(ctx, "command", None), "name", None) in {"canceltraining", "botstatus", "backupdb"}:
+    if getattr(getattr(ctx, "command", None), "name", None) in {"canceltraining", "botstatus", "backupdb", "servers", "leaveguild"}:
         return True
     if not in_duel_channel(ctx):
         await ctx.send("Continue your Duel in the channel where it was accepted.")
@@ -3179,6 +3179,51 @@ async def houseleaderboard(ctx):
 
 @bot.command()
 @commands.check(owner_check)
+async def servers(ctx):
+    guilds = list(bot.guilds)
+    if not guilds:
+        await ctx.send("Duellium is not currently in any servers.")
+        return
+    parts = ["🌐 **DUELLIUM SERVERS**"]
+    for index, guild in enumerate(guilds, 1):
+        name = discord.utils.escape_mentions(discord.utils.escape_markdown(guild.name[:100]))
+        members = guild.member_count if guild.member_count is not None else "Unknown"
+        parts.append(f"{index}. {name}\n   ID: {guild.id}\n   Members: {members}")
+    parts.append(f"Total servers: {len(guilds)}")
+    message = ""
+    for part in parts:
+        if message and len((message + "\n\n" + part).encode("utf-16-le")) // 2 > 1900:
+            await ctx.send(message)
+            message = ""
+        message = f"{message}\n\n{part}" if message else part
+    if message:
+        await ctx.send(message)
+
+
+@bot.command()
+@commands.check(owner_check)
+async def leaveguild(ctx, guild_id: int):
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await ctx.send("Server not found or Duellium is not currently in that server.")
+        return
+    guild_name = guild.name
+    name = discord.utils.escape_mentions(discord.utils.escape_markdown(guild_name))
+    logger.info("Owner %s requested leaving guild %s name=%r", ctx.author.id, guild.id, guild_name)
+    await ctx.send(f"Duellium is leaving **{name}** ({guild.id}).")
+    try:
+        await guild.leave()
+    except discord.HTTPException:
+        logger.exception("Could not leave guild %s requested by owner %s", guild.id, ctx.author.id)
+        await ctx.send("Duellium could not leave that server. Please try again.")
+        return
+    logger.info("Duellium left guild %s name=%r at owner %s request", guild.id, guild_name, ctx.author.id)
+    if ctx.guild is None or ctx.guild.id != guild.id:
+        await ctx.send(f"✅ Duellium left {name} ({guild.id}).")
+
+
+@bot.command()
+@commands.check(owner_check)
 async def botstatus(ctx):
     try:
         healthy, saved = database.database_health()
@@ -3267,7 +3312,7 @@ async def capture_combat_session(ctx):
 
 @bot.check
 async def guild_context(ctx):
-    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test"}:
+    if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test", "servers", "leaveguild"}:
         raise commands.NoPrivateMessage()
     return True
 
