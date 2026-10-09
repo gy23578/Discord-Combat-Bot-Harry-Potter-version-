@@ -1,0 +1,26 @@
+[Unit]
+Description=Harry Potter private beta Discord bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=harrybot
+Group=harrybot
+WorkingDirectory=/opt/harry-potter-bot
+ExecStart=/opt/harry-potter-bot/.venv/bin/python -u /opt/harry-potter-bot/bot.py
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/harry-potter-bot
+
+[Install]
+WantedBy=multi-user.target
