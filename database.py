@@ -38,6 +38,7 @@ def init_database():
         db.execute("CREATE INDEX IF NOT EXISTS local_points_user ON local_player_points(user_id, points)")
         db.execute("CREATE TABLE IF NOT EXISTS local_house_points (guild_id INTEGER NOT NULL, house TEXT NOT NULL CHECK(house IN ('gryffindor','slytherin','ravenclaw','hufflepuff')), points INTEGER NOT NULL DEFAULT 0 CHECK(points >= 0), PRIMARY KEY(guild_id, house))")
         db.execute("CREATE TABLE IF NOT EXISTS ranked_duel_results (session_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, winner_id INTEGER NOT NULL, loser_id INTEGER NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY, language TEXT NOT NULL DEFAULT 'en' CHECK(language IN ('en', 'fr')))")
     logger.info("Database initialized: %s", DATABASE_FILE)
 
 
@@ -215,3 +216,17 @@ def house_leaderboard(guild_id):
     with connection() as db:
         points = dict(db.execute("SELECT house, points FROM local_house_points WHERE guild_id=?", (guild_id,)).fetchall())
     return sorted(((house, points.get(house, 0)) for house in VALID_HOUSES), key=lambda item: (-item[1], item[0]))
+
+
+def get_guild_language(guild_id):
+    with connection() as db:
+        row = db.execute("SELECT language FROM guild_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    return row[0] if row else "en"
+
+
+def set_guild_language(guild_id, language):
+    from translations import SUPPORTED_LANGUAGES
+    if language not in SUPPORTED_LANGUAGES:
+        raise ValueError("Unsupported guild language")
+    with connection() as db:
+        db.execute("INSERT INTO guild_settings(guild_id, language) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET language=excluded.language", (guild_id, language))

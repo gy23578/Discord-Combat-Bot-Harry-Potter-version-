@@ -2,6 +2,8 @@
 
 Duellium is a competitive wizard dueling game built directly into Discord.
 
+Available in 🇬🇧 English and 🇫🇷 Français, with a language setting for each server.
+
 Create your wizard, choose your Hogwarts House, learn spells, improve your abilities, and challenge other players to ranked duels.
 
 Your Duellium profile is global: your character, progression, spells, and stats follow you across every Discord server using Duellium.

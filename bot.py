@@ -10,6 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 import database
 from operations import configure_logging, ProcessLock
+from translations import (tr, translate, CURRENT_LANGUAGE, LANGUAGE_NAMES, LANGUAGE_INPUTS,
+                          COMMAND_ALIASES, house_display, stat_display, combat_stat_display,
+                          normalize_input, localized_label, quiz_display, parameter_display, command_signature)
+from localization import (language_for_context, localized_context, localized_session,
+                          guild_language_cache, clear_language_cache, install_command_localization)
 from combat import MODELED_SPELLS, CURSE_MIN_ROLLS, PROTEGO_DAMAGE_PERCENT, roll_offensive_effect, choose_forced_spell
 from database import init_database, save_player, load_player
 
@@ -153,6 +158,7 @@ def persist_runtime():
 
 def restore_runtime():
     """Discard legacy live snapshots; never resume combat or penalize downtime."""
+    clear_language_cache()
     database.clear_runtime()
     for handle in duel_inactivity_timers.values():
         handle.cancel()
@@ -248,7 +254,7 @@ def normalize_spell_name(name: str) -> str:
 
 def stars(difficulty: int) -> str:
     if difficulty <= 0:
-        return "Starting Spell"
+        return tr('stars.text_01')
     return "★" * difficulty + "☆" * (5 - difficulty)
 
 def persist_player(player):
@@ -608,11 +614,12 @@ def in_duel_channel(ctx):
 
 
 @bot.check
+@localized_context
 async def check_duel_channel(ctx):
     if getattr(getattr(ctx, "command", None), "name", None) in {"canceltraining", "botstatus", "backupdb", "servers", "leaveguild"}:
         return True
     if not in_duel_channel(ctx):
-        await ctx.send("Continue your Duel in the channel where it was accepted.")
+        await ctx.send(tr('check_duel_channel.text_01'))
         return False
     return True
 
@@ -687,6 +694,7 @@ def note_duel_activity(user_id, session_id=None, channel_id=None):
     return True
 
 
+@localized_session
 async def expire_inactive_duel(session, channel=None):
     if session.get("mode") == "training" or session.get("ending"):
         return False
@@ -710,7 +718,7 @@ async def expire_inactive_duel(session, channel=None):
             player = load_player(uid)
             if player is not None:
                 players[uid] = player
-        names.append(player["name"] if player is not None else f"Player {uid}")
+        names.append(player["name"] if player is not None else tr('expire_inactive_duel.text_01', p0=uid))
         active_duels.pop(uid, None)
         duel_sessions.pop(uid, None)
         pending_attacks.pop(uid, None)
@@ -728,9 +736,7 @@ async def expire_inactive_duel(session, channel=None):
     logger.info("Duel %s ended due to inactivity", session["id"])
     persist_runtime()
     message = (
-        "⏳ **DUEL ENDED DUE TO INACTIVITY**\n\n"
-        f"**{names[0]}** and **{names[1]}** didn't finish the duel.\n\n"
-        f"⭐ {names[0]}: **-10 XP**\n⭐ {names[1]}: **-10 XP**"
+        tr('expire_inactive_duel.text_02', p0=names[0], p1=names[1], p2=names[0], p3=names[1])
     )
     try:
         if channel is None:
@@ -775,7 +781,7 @@ def evaluate_spell_requirements(player, spell_key, include_practical=True):
     if "level" in requirements:
         required = requirements["level"]
         current = player["level"]
-        results.append((current >= required, f"Level {required} ({current}/{required})"))
+        results.append((current >= required, tr('evaluate_spell_requirements.text_01', p0=required, p1=current, p2=required)))
 
     for required_spell, base_required_level in requirements.get("spell_levels", {}).items():
         required_level = ravenclaw_requirement(player, "spell_level", base_required_level)
@@ -783,31 +789,31 @@ def evaluate_spell_requirements(player, spell_key, include_practical=True):
         display = SPELLS[required_spell]["display_name"]
         results.append((
             current >= required_level,
-            f"{display} Spell Level {required_level} ({current}/{required_level})"
+            tr('evaluate_spell_requirements.text_02', p0=display, p1=required_level, p2=current, p3=required_level)
         ))
 
     for stat_name, base_required_value in requirements.get("min_stats", {}).items():
         required_value = ravenclaw_requirement(player, "min_stat", base_required_value)
         current = player["stats"].get(stat_name, 0)
-        display = STAT_DISPLAY_NAMES.get(stat_name, stat_name)
+        display = stat_display(stat_name)
         results.append((
             current >= required_value,
-            f"{display} {required_value} ({current}/{required_value})"
+            tr('evaluate_spell_requirements.text_03', p0=display, p1=required_value, p2=current, p3=required_value)
         ))
 
     if "duel_wins" in requirements:
         required = ravenclaw_requirement(player, "duel_wins", requirements["duel_wins"])
         current = player["duel_wins"]
-        results.append((current >= required, f"Win {required} Duels ({current}/{required})"))
+        results.append((current >= required, tr('evaluate_spell_requirements.text_04', p0=required, p1=current, p2=required)))
 
     if include_practical:
         for stat_name, base_required_value in requirements.get("combat_stats", {}).items():
             required_value = ravenclaw_requirement(player, "combat_stat", base_required_value)
             current = player["combat_stats"].get(stat_name, 0)
-            display = COMBAT_STAT_DISPLAY_NAMES.get(stat_name, stat_name)
+            display = combat_stat_display(stat_name)
             results.append((
                 current >= required_value or practical_requirement_met(player, spell_key, f"combat_stats:{stat_name}"),
-                f"{display}: {required_value} " + ("(practical training completed)" if practical_requirement_met(player, spell_key, f"combat_stats:{stat_name}") else f"({current}/{required_value})")
+                tr('evaluate_spell_requirements.text_05', p0=display, p1=required_value) + (tr('evaluate_spell_requirements.text_06') if practical_requirement_met(player, spell_key, f"combat_stats:{stat_name}") else f"({current}/{required_value})")
             ))
 
         for required_spell, base_required_hits in requirements.get("spell_hits", {}).items():
@@ -816,12 +822,12 @@ def evaluate_spell_requirements(player, spell_key, include_practical=True):
             display = SPELLS[required_spell]["display_name"]
             results.append((
                 current >= required_hits or practical_requirement_met(player, spell_key, f"spell_hits:{required_spell}"),
-                f"Land {display} {required_hits} times " + ("(practical training completed)" if practical_requirement_met(player, spell_key, f"spell_hits:{required_spell}") else f"({current}/{required_hits})")
+                tr('evaluate_spell_requirements.text_07', p0=display, p1=required_hits) + (tr('evaluate_spell_requirements.text_08') if practical_requirement_met(player, spell_key, f"spell_hits:{required_spell}") else f"({current}/{required_hits})")
             ))
 
     for required_spell in requirements.get("required_spells", []):
         display = SPELLS[required_spell]["display_name"]
-        results.append((required_spell in player["learned_spells"], f"Learn {display}"))
+        results.append((required_spell in player["learned_spells"], tr('evaluate_spell_requirements.text_09', p0=display)))
 
     if requirements.get("all_other_spells"):
         other_unlockable_spells = {
@@ -831,9 +837,9 @@ def evaluate_spell_requirements(player, spell_key, include_practical=True):
         }
         missing = sorted(other_unlockable_spells - player["learned_spells"])
         if missing:
-            results.append((False, f"Learn every other Spell ({len(missing)} remaining)"))
+            results.append((False, tr('evaluate_spell_requirements.text_10', p0=len(missing))))
         else:
-            results.append((True, "Learn every other Spell"))
+            results.append((True, tr('evaluate_spell_requirements.text_11')))
 
     return results
 
@@ -898,21 +904,25 @@ def select_quiz_questions(difficulty, count, categories):
     return prepared
 
 
+@localized_context
 async def send_learning_question(ctx, trial):
     index = trial["current_question"]
     question = trial["questions"][index]
 
     answers_text = "\n".join(
-        f"**{letter}.** {answer}"
+        tr('send_learning_question.text_01', p0=letter, p1=quiz_display(answer))
         for letter, answer in question["answers"].items()
     )
 
     await ctx.send(
-        f"📚 **{trial['display_name']} — Knowledge Trial**\n"
-        f"Question **{index + 1}/{len(trial['questions'])}**\n\n"
-        f"**{question['question']}**\n\n"
-        f"{answers_text}\n\n"
-        f"Answer with `!answer A`, `!answer B`, `!answer C`, or `!answer D`."
+        tr(
+            'send_learning_question.text_02',
+            p0=trial['display_name'],
+            p1=index + 1,
+            p2=len(trial['questions']),
+            p3=quiz_display(question['question']),
+            p4=answers_text,
+        )
     )
 
 
@@ -920,6 +930,7 @@ async def send_learning_question(ctx, trial):
 # DUEL END / DAMAGE HELPERS
 # =========================================================
 
+@localized_context
 async def check_duel_end(ctx, loser, session_id=None):
     if session_id is not None and not session_is_current(loser.id, session_id):
         return False
@@ -928,7 +939,7 @@ async def check_duel_end(ctx, loser, session_id=None):
     if session is not None:
         completed = all(objective_complete(obj) for obj in session["objectives"].values())
         if completed or loser_player["hp"] <= 0:
-            await end_training(ctx, session, "A participant reached 0 HP", completed=completed)
+            await end_training(ctx, session, tr('check_duel_end.text_01'), completed=completed)
             return True
         return False
 
@@ -992,44 +1003,52 @@ async def check_duel_end(ctx, loser, session_id=None):
         winner_before, winner_after = ranking["players"][winner_id]
         loser_before, loser_after = ranking["players"][loser.id]
         ranking_text = (
-            f"\n\n**SERVER POINTS**\n"
-            f"{winner.display_name}: {winner_before} → {winner_after} (+10)\n"
-            f"{loser.display_name}: {loser_before} → {loser_after} ({loser_after - loser_before:+d})"
+            tr(
+                'check_duel_end.text_02',
+                p0=winner.display_name,
+                p1=winner_before,
+                p2=winner_after,
+                p3=loser.display_name,
+                p4=loser_before,
+                p5=loser_after,
+                p6=loser_after - loser_before,
+            )
         )
         if ranking["house"] is not None:
-            ranking_text += f"\n🏠 **{HOUSE_NAMES[ranking['house']]} +10 House Points**"
+            ranking_text += tr('check_duel_end.text_03', p0=house_display(ranking['house']))
     else:
         # Missing guilds or states without a legitimate surviving winner earn no ranking points.
         database.save_players([winner_player, loser_player])
     logger.info("Normal duel %s completed", session["id"])
 
     await ctx.send(
-        f"🏆 **DUEL OVER!**\n"
-        f"✨ {winner.display_name} defeats {loser.display_name}!\n"
-        f"❤️ {loser.display_name}: **0/{loser_player['max_hp']} HP**\n"
-        f"⭐ {winner.display_name} earns **50 XP**.\n"
-        f"⭐ {loser.display_name} earns **20 XP**."
+        tr(
+            'check_duel_end.text_04',
+            p0=winner.display_name,
+            p1=loser.display_name,
+            p2=loser.display_name,
+            p3=loser_player['max_hp'],
+            p4=winner.display_name,
+            p5=loser.display_name,
+        )
         + ranking_text
     )
 
     if winner_leveled_up:
         await ctx.send(
-            f"🌟 **{winner.display_name} reached "
-            f"Level {winner_player['level']}!**\n"
-            f"🎯 Talent Points were awarded for the new Level."
+            tr('check_duel_end.text_05', p0=winner.display_name, p1=winner_player['level'])
         )
 
     if loser_leveled_up:
         await ctx.send(
-            f"🌟 **{loser.display_name} reached "
-            f"Level {loser_player['level']}!**\n"
-            f"🎯 Talent Points were awarded for the new Level."
+            tr('check_duel_end.text_06', p0=loser.display_name, p1=loser_player['level'])
         )
 
     persist_runtime()
     return True
 
 
+@localized_context
 async def apply_sectumsempra_bleed(ctx, defender_user, attacker_user, session_id):
     for delay in (3, 3):
         await asyncio.sleep(delay)
@@ -1042,14 +1061,14 @@ async def apply_sectumsempra_bleed(ctx, defender_user, attacker_user, session_id
         persist_player(defender)
 
         await ctx.send(
-            f"🩸 **Sectumsempra bleeding deals 6 damage to {defender_user.display_name}.**\n"
-            f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
+            tr('apply_sectumsempra_bleed.text_01', p0=defender_user.display_name, p1=defender['hp'], p2=defender['max_hp'])
         )
 
         if await check_duel_end(ctx, defender_user, session_id):
             return
 
 
+@localized_context
 async def apply_sectumsempra_backlash(ctx, attack, defense_power):
     if attack.get("session_id") is not None and not session_is_current(attack["attacker_id"], attack["session_id"]):
         return
@@ -1072,14 +1091,19 @@ async def apply_sectumsempra_backlash(ctx, attack, defense_power):
     persist_player(attacker)
 
     await ctx.send(
-        f"🩸 **Sectumsempra backfires!**\n"
-        f"{attacker_user.display_name} takes **{backlash} backlash damage**.\n"
-        f"❤️ HP: **{attacker['hp']}/{attacker['max_hp']}**"
+        tr(
+            'apply_sectumsempra_backlash.text_01',
+            p0=attacker_user.display_name,
+            p1=backlash,
+            p2=attacker['hp'],
+            p3=attacker['max_hp'],
+        )
     )
 
     await check_duel_end(ctx, attacker_user, attack.get("session_id"))
 
 
+@localized_context
 async def apply_attack(ctx, defender_user, attack):
     defender = get_player(defender_user)
     if not session_is_current(defender_user.id, attack["session_id"]):
@@ -1101,9 +1125,7 @@ async def apply_attack(ctx, defender_user, attack):
         database.save_players([attacker, defender])
 
         await ctx.send(
-            f"🔥 **Confringo hits {defender_user.display_name}!**\n"
-            f"💥 Damage: **{damage}**\n"
-            f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
+            tr('apply_attack.text_01', p0=defender_user.display_name, p1=damage, p2=defender['hp'], p3=defender['max_hp'])
         )
 
         if not session_is_current(defender_user.id, attack["session_id"]):
@@ -1136,10 +1158,7 @@ async def apply_attack(ctx, defender_user, attack):
         # end the Duel immediately
         if defender["hp"] <= 0:
             await ctx.send(
-                f"⚡ **Expelliarmus hits "
-                f"{defender_user.display_name}!**\n"
-                f"💥 Damage: **{damage}**\n"
-                f"❤️ HP: **0/{defender['max_hp']}**"
+                tr('apply_attack.text_02', p0=defender_user.display_name, p1=damage, p2=defender['max_hp'])
             )
 
             await check_duel_end(
@@ -1156,13 +1175,15 @@ async def apply_attack(ctx, defender_user, attack):
         )["unarmed_until"] = time.time() + duration
 
         await ctx.send(
-            f"⚡ **Expelliarmus hits "
-            f"{defender_user.display_name}!**\n"
-            f"💥 Damage: **{damage}**\n"
-            f"🪄 {defender_user.display_name} "
-            f"is unarmed for **{duration} seconds**!\n"
-            f"❤️ HP: "
-            f"**{defender['hp']}/{defender['max_hp']}**"
+            tr(
+                'apply_attack.text_03',
+                p0=defender_user.display_name,
+                p1=damage,
+                p2=defender_user.display_name,
+                p3=duration,
+                p4=defender['hp'],
+                p5=defender['max_hp'],
+            )
         )
 
     elif spell == "stupefy":
@@ -1180,9 +1201,7 @@ async def apply_attack(ctx, defender_user, attack):
 
         if defender["hp"] <= 0:
             await ctx.send(
-                f"🔴 **Stupefy hits {defender_user.display_name}!**\n"
-                f"💥 Damage: **{damage}**\n"
-                f"❤️ HP: **0/{defender['max_hp']}**"
+                tr('apply_attack.text_04', p0=defender_user.display_name, p1=damage, p2=defender['max_hp'])
             )
             await check_duel_end(ctx, defender_user, attack["session_id"])
             return
@@ -1192,10 +1211,15 @@ async def apply_attack(ctx, defender_user, attack):
         )
 
         await ctx.send(
-            f"🔴 **Stupefy hits {defender_user.display_name}!**\n"
-            f"💥 Damage: **{damage}**\n"
-            f"💫 {defender_user.display_name} is stunned for **{duration} seconds**!\n"
-            f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
+            tr(
+                'apply_attack.text_05',
+                p0=defender_user.display_name,
+                p1=damage,
+                p2=defender_user.display_name,
+                p3=duration,
+                p4=defender['hp'],
+                p5=defender['max_hp'],
+            )
         )
 
     elif spell == "sectumsempra":
@@ -1207,9 +1231,7 @@ async def apply_attack(ctx, defender_user, attack):
 
         persist_player(defender)
         await ctx.send(
-            f"🩸 **Sectumsempra hits {defender_user.display_name}!**\n"
-            f"💥 Damage: **{damage}**\n"
-            f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
+            tr('apply_attack.text_06', p0=defender_user.display_name, p1=damage, p2=defender['hp'], p3=defender['max_hp'])
         )
 
         if not session_is_current(defender_user.id, attack["session_id"]):
@@ -1229,7 +1251,7 @@ async def apply_attack(ctx, defender_user, attack):
 
         persist_player(defender)
         await ctx.send(
-            f"💀 **AVADA KEDAVRA hits {defender_user.display_name}.**"
+            tr('apply_attack.text_07', p0=defender_user.display_name)
         )
 
         if not session_is_current(defender_user.id, attack["session_id"]):
@@ -1245,12 +1267,12 @@ async def apply_attack(ctx, defender_user, attack):
         gain_combat_spell_xp(attacker, spell, 15, training=training)
         if spell == "endoloris":
             hit_time = time.monotonic()
-            await ctx.send(f"⚡ **Endoloris afflicts {defender_user.display_name}!** No immediate damage; 14 damage at 3s, 6s, and 9s.")
+            await ctx.send(tr('apply_attack.text_08', p0=defender_user.display_name))
             spawn_combat_task(attack["session_id"], apply_endoloris(ctx, defender_user, attack["session_id"], hit_time))
         else:
             forced_spell = choose_forced_spell(defender)
             if forced_spell is None:
-                await ctx.send("Impero finds no eligible offensive spell.")
+                await ctx.send(tr('apply_attack.text_09'))
                 return
             effect = roll_offensive_effect(forced_spell, defender["spell_levels"][forced_spell])
             await queue_attack(ctx, defender_user, defender_user, forced_spell,
@@ -1273,7 +1295,14 @@ async def apply_attack(ctx, defender_user, attack):
         gain_combat_player_xp(attacker, 15, training=training)
         gain_combat_spell_xp(attacker, spell, 15, training=training)
         persist_player(defender)
-        await ctx.send(f"{SPELLS[spell]['emoji']} **{SPELLS[spell]['display_name']} hits!** Damage: **{attack['damage']}**. HP: **{defender['hp']}/{defender['max_hp']}**")
+        await ctx.send(tr(
+            'apply_attack.text_10',
+            p0=SPELLS[spell]['emoji'],
+            p1=SPELLS[spell]['display_name'],
+            p2=attack['damage'],
+            p3=defender['hp'],
+            p4=defender['max_hp'],
+        ))
         if not await check_duel_end(ctx, defender_user, attack["session_id"]) and spell == "incendio":
             spawn_combat_task(attack["session_id"], apply_burn(ctx, defender_user, attack["session_id"]))
 
@@ -1284,6 +1313,7 @@ async def apply_attack(ctx, defender_user, attack):
     await report_training_progress(ctx, defender_user.id, attack["session_id"])
 
 
+@localized_context
 async def apply_burn(ctx, defender_user, session_id):
     for _ in range(2):
         await asyncio.sleep(3)
@@ -1292,11 +1322,12 @@ async def apply_burn(ctx, defender_user, session_id):
         defender = get_player(defender_user)
         defender["hp"] = max(0, defender["hp"] - 4)
         persist_player(defender)
-        await ctx.send(f"🔥 Burn deals **4 damage** to {defender_user.display_name}.")
+        await ctx.send(tr('apply_burn.text_01', p0=defender_user.display_name))
         if await check_duel_end(ctx, defender_user, session_id):
             return
 
 
+@localized_context
 async def apply_endoloris(ctx, defender_user, session_id, hit_time=None):
     hit_time = time.monotonic() if hit_time is None else hit_time
     for offset in (3, 6, 9):
@@ -1306,7 +1337,7 @@ async def apply_endoloris(ctx, defender_user, session_id, hit_time=None):
         defender = get_player(defender_user)
         defender["hp"] = max(0, defender["hp"] - 14)
         persist_player(defender)
-        await ctx.send(f"⚡ **Endoloris deals 14 damage to {defender_user.display_name}.** HP: **{defender['hp']}/{defender['max_hp']}**")
+        await ctx.send(tr('apply_endoloris.text_01', p0=defender_user.display_name, p1=defender['hp'], p2=defender['max_hp']))
         if await check_duel_end(ctx, defender_user, session_id):
             return
 
@@ -1322,28 +1353,28 @@ async def launch_attack(
     base_cooldown=6,
 ):
     if active_duels.get(ctx.author.id) != opponent.id or not in_duel_channel(ctx):
-        await ctx.send("This Duel is no longer available here.")
+        await ctx.send(tr('launch_attack.text_01'))
         return
     if is_stunned(ctx.author.id):
         await ctx.send(
-            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+            tr('launch_attack.text_02', p0=remaining_stun_time(ctx.author.id))
         )
         return
 
     if ctx.author.id in active_casts:
-        await ctx.send("⏳ Your previous spell has not been resolved yet.")
+        await ctx.send(tr('launch_attack.text_03'))
         return
 
     if is_on_cooldown(ctx.author.id):
         remaining = remaining_cooldown(ctx.author.id)
         await ctx.send(
-            f"⏳ You are recovering for another **{remaining:.1f} seconds**."
+            tr('launch_attack.text_04', p0=remaining)
         )
         return
 
     if opponent.id in pending_attacks:
         await ctx.send(
-            f"⚠️ {opponent.display_name} already has an Attack to react to."
+            tr('launch_attack.text_05', p0=opponent.display_name)
         )
         return
 
@@ -1377,12 +1408,12 @@ async def _queue_attack(ctx, caster, opponent, spell_name, power, accuracy,
     attacker_player = get_player(caster)
     cooldown = calculate_cooldown(attacker_player, base_cooldown)
     if not forced and not note_duel_activity(caster.id, session_id, ctx.channel.id):
-        await ctx.send("This Duel has ended or expired.")
+        await ctx.send(tr('_queue_attack.text_01'))
         return
     if spell_name in CURSE_MIN_ROLLS and random.randint(1, 6) < CURSE_MIN_ROLLS[spell_name]:
         start_cooldown(caster.id, cooldown)
         persist_runtime()
-        await ctx.send("❌ **Spell missed.**")
+        await ctx.send(tr('_queue_attack.text_02'))
         return
     active_casts.add(caster.id)
     attack_id = time.time_ns()
@@ -1399,11 +1430,16 @@ async def _queue_attack(ctx, caster, opponent, spell_name, power, accuracy,
         "forced": forced,
     }
     persist_runtime()
-    verb = "is compelled by Impero to cast" if forced else "casts"
+    verb = tr('_queue_attack.text_03') if forced else tr("attack.cast")
     await ctx.send(
-        f"🪄 **{caster.display_name} {verb} {SPELLS[spell_name]['display_name'].upper()} at {opponent.display_name}!**\n"
-        f"⏳ {opponent.display_name} has **10 seconds** to react.\n"
-        f"Reactions: `!protego`, `!expelliarmus`, or `!dodge`."
+        tr(
+            '_queue_attack.text_04',
+            p0=caster.display_name,
+            p1=verb,
+            p2=SPELLS[spell_name]['display_name'].upper(),
+            p3=opponent.display_name,
+            p4=opponent.display_name,
+        )
     )
 
     await asyncio.sleep(10)
@@ -1419,7 +1455,7 @@ async def _queue_attack(ctx, caster, opponent, spell_name, power, accuracy,
     finish_attack(current_attack)
 
     await ctx.send(
-        f"⌛ {opponent.display_name} did not react in time!"
+        tr('_queue_attack.text_05', p0=opponent.display_name)
     )
 
     await apply_attack(ctx, opponent, current_attack)
@@ -1447,7 +1483,7 @@ async def on_ready():
 
 @bot.command()
 async def test(ctx):
-    await ctx.send("The bot is working 🪄")
+    await ctx.send(tr('test.text_01'))
 
 
 # =========================================================
@@ -1462,41 +1498,37 @@ async def profile(ctx):
         player["profile_started"] = True
         persist_player(player)
         await ctx.send(
-            "🧙 **Create Your Wizard**\n\n"
-            "Choose your House:\n\n"
-            "🦁 `!house gryffindor`\n"
-            "🐍 `!house slytherin`\n"
-            "🦅 `!house ravenclaw`\n"
-            "🦡 `!house hufflepuff`\n\n"
-            "⚠️ Your House choice is permanent."
+            tr('profile.text_01')
         )
         return
 
     stats = player["stats"]
-    ready_text = "✅ Ready to Duel" if player["ready"] else "⚠️ Spend your remaining Talent Points"
+    ready_text = tr('profile.text_02') if player["ready"] else tr('profile.text_03')
 
     learned_lines = []
     for spell_key in sorted(player["learned_spells"], key=lambda k: SPELLS[k]["display_name"]):
         spell = SPELLS[spell_key]
         learned_lines.append(
-            f"{spell['emoji']} {spell['display_name']} — Spell Level {player['spell_levels'][spell_key]}"
+            tr('profile.text_04', p0=spell['emoji'], p1=spell['display_name'], p2=player['spell_levels'][spell_key])
         )
 
     await ctx.send(
-        f"🧙 **{player['name']}**\n\n"
-        f"🏠 House: **{HOUSE_NAMES[player['house']]}**\n"
-        f"⭐ Level: **{player['level']}**\n"
-        f"✨ XP: **{player['xp']}**\n"
-        f"❤️ HP: **{player['hp']}/{player['max_hp']}**\n\n"
-        f"📊 **STATS**\n"
-        f"🛡️ Endurance: **{stats['endurance']}**\n"
-        f"✨ Magic Power: **{stats['magic_power']}**\n"
-        f"⚡ Speed: **{stats['speed']}**\n"
-        f"💨 Agility: **{stats['agility']}**\n\n"
-        f"🎯 Talent Points: **{player['talent_points']}**\n\n"
-        f"⚔️ **DUEL RECORD**\n"
-        f"Wins: **{player['duel_wins']}** | Losses: **{player['duel_losses']}**\n\n"
-        f"📚 **SPELLS LEARNED**\n"
+        tr(
+            'profile.text_05',
+            p0=player['name'],
+            p1=house_display(player['house']),
+            p2=player['level'],
+            p3=player['xp'],
+            p4=player['hp'],
+            p5=player['max_hp'],
+            p6=stats['endurance'],
+            p7=stats['magic_power'],
+            p8=stats['speed'],
+            p9=stats['agility'],
+            p10=player['talent_points'],
+            p11=player['duel_wins'],
+            p12=player['duel_losses'],
+        )
         + "\n".join(learned_lines)
         + f"\n\n{ready_text}"
     )
@@ -1507,17 +1539,17 @@ async def house(ctx, house_name: str):
     player = get_player(ctx.author)
 
     if not player["profile_started"]:
-        await ctx.send("Use `!profile` first.")
+        await ctx.send(tr('house.text_01'))
         return
 
     if player["house"] is not None:
-        await ctx.send("🏠 You have already chosen your House.")
+        await ctx.send(tr('house.text_02'))
         return
 
-    house_name = house_name.lower()
+    house_name = normalize_input("house", house_name.lower())
     if house_name not in HOUSE_STATS:
         await ctx.send(
-            "Unknown House. Choose `gryffindor`, `slytherin`, `ravenclaw`, or `hufflepuff`."
+            tr('house.text_03')
         )
         return
 
@@ -1530,17 +1562,14 @@ async def house(ctx, house_name: str):
 
     stats = player["stats"]
     await ctx.send(
-        f"🏠 **You joined {HOUSE_NAMES[house_name]}!**\n\n"
-        f"📊 Starting Stats:\n"
-        f"🛡️ Endurance: **{stats['endurance']}**\n"
-        f"✨ Magic Power: **{stats['magic_power']}**\n"
-        f"⚡ Speed: **{stats['speed']}**\n"
-        f"💨 Agility: **{stats['agility']}**\n\n"
-        f"🎯 You have **3 Talent Points** to spend.\n\n"
-        f"`!train endurance`\n"
-        f"`!train magicpower`\n"
-        f"`!train speed`\n"
-        f"`!train agility`"
+        tr(
+            'house.text_04',
+            p0=house_display(house_name),
+            p1=stats['endurance'],
+            p2=stats['magic_power'],
+            p3=stats['speed'],
+            p4=stats['agility'],
+        )
     )
 
 
@@ -1549,24 +1578,24 @@ async def train(ctx, stat_name: str):
     player = get_player(ctx.author)
 
     if player["house"] is None:
-        await ctx.send("Create your Profile first.")
+        await ctx.send(tr('train.text_01'))
         return
 
     if ctx.author.id in active_duels:
-        await ctx.send("⚠️ You cannot train your stats during a Duel.")
+        await ctx.send(tr('train.text_02'))
         return
 
     if player["talent_points"] <= 0:
-        await ctx.send("You have no Talent Points left.")
+        await ctx.send(tr('train.text_03'))
         return
 
-    stat_name = stat_name.lower()
+    stat_name = normalize_input("stat", stat_name.lower())
     if stat_name == "magicpower":
         stat_name = "magic_power"
 
     if stat_name not in STAT_DISPLAY_NAMES:
         await ctx.send(
-            "Unknown stat. Choose `endurance`, `magicpower`, `speed`, or `agility`."
+            tr('train.text_04')
         )
         return
 
@@ -1582,16 +1611,13 @@ async def train(ctx, stat_name: str):
         player["ready"] = True
     persist_player(player)
     await ctx.send(
-        f"⬆️ **{STAT_DISPLAY_NAMES[stat_name]} +1**\n"
-        f"New value: **{player['stats'][stat_name]}**\n"
-        f"🎯 Talent Points remaining: **{player['talent_points']}**"
+        tr('train.text_05', p0=stat_display(stat_name), p1=player['stats'][stat_name], p2=player['talent_points'])
     )
 
     if player["talent_points"] == 0:
         player["ready"] = True
         await ctx.send(
-            "✅ **Your character is ready!**\n"
-            "You can now participate in Duels."
+            tr('train.text_06')
         )
 
     persist_player(player)
@@ -1606,7 +1632,7 @@ async def spellbook(ctx):
     player = get_player(ctx.author)
 
     if player["house"] is None:
-        await ctx.send("Create your Profile first with `!profile`.")
+        await ctx.send(tr('spellbook.text_01'))
         return
 
     learned = []
@@ -1617,16 +1643,16 @@ async def spellbook(ctx):
         if spell.get("starting"):
             if spell_key in player["learned_spells"]:
                 learned.append(
-                    f"{spell['emoji']} **{spell['display_name']}** — Spell Level {player['spell_levels'][spell_key]}"
+                    tr('spellbook.text_02', p0=spell['emoji'], p1=spell['display_name'], p2=player['spell_levels'][spell_key])
                 )
             continue
 
         status = spell_status(player, spell_key, ctx.author.id)
-        line = f"{spell['emoji']} **{spell['display_name']}** {stars(spell['difficulty'])}"
+        line = tr('spellbook.text_03', p0=spell['emoji'], p1=spell['display_name'], p2=stars(spell['difficulty']))
 
         if spell_key in player["learned_spells"]:
             learned.append(
-                f"{spell['emoji']} **{spell['display_name']}** — Spell Level {player['spell_levels'][spell_key]}"
+                tr('spellbook.text_04', p0=spell['emoji'], p1=spell['display_name'], p2=player['spell_levels'][spell_key])
             )
         elif status == "📘 READY TO LEARN":
             ready.append(line)
@@ -1634,14 +1660,14 @@ async def spellbook(ctx):
             requirements = evaluate_spell_requirements(player, spell_key)
             completed = sum(1 for met, _ in requirements if met)
             total = len(requirements)
-            progress = f" — {completed}/{total} requirements" if total else ""
+            progress = tr('spellbook.text_06', p0=completed, p1=total) if total else ""
             locked.append(line + progress)
 
-    message = "📖 **SPELLBOOK**\n\n"
-    message += "✅ **LEARNED**\n" + ("\n".join(learned) if learned else "None")
-    message += "\n\n📘 **READY TO LEARN**\n" + ("\n".join(ready) if ready else "None")
-    message += "\n\n🔒 **LOCKED / IN PROGRESS**\n" + ("\n".join(locked) if locked else "None")
-    message += "\n\nUse `!spell <name>` for details or `!learn <name>` to start a Knowledge Trial."
+    message = tr('spellbook.text_07')
+    message += tr('spellbook.text_08') + ("\n".join(learned) if learned else tr('spellbook.text_09'))
+    message += tr('spellbook.text_10') + ("\n".join(ready) if ready else tr('spellbook.text_11'))
+    message += tr('spellbook.text_12') + ("\n".join(locked) if locked else tr('spellbook.text_13'))
+    message += tr('spellbook.text_14')
 
     await ctx.send(message)
 
@@ -1652,31 +1678,31 @@ async def spell_info(ctx, *, spell_name: str):
     spell_key = normalize_spell_name(spell_name)
 
     if spell_key not in SPELLS:
-        await ctx.send("❌ Unknown spell.")
+        await ctx.send(tr('spell_info.text_01'))
         return
 
     spell = SPELLS[spell_key]
     status = spell_status(player, spell_key, ctx.author.id)
 
     lines = [
-        f"{spell['emoji']} **{spell['display_name'].upper()}**",
-        f"Difficulty: **{stars(spell['difficulty'])}**",
-        f"Status: **{status}**",
+        tr('spell_info.text_02', p0=spell['emoji'], p1=spell['display_name'].upper()),
+        tr('spell_info.text_03', p0=stars(spell['difficulty'])),
+        tr('spell_info.text_04', p0=localized_label(status)),
         "",
-        spell["description"],
+        tr("spell.description." + spell_key),
     ]
 
     if spell.get("starting"):
-        lines.append("\nThis is a Starting Spell.")
+        lines.append(tr('spell_info.text_05'))
     else:
-        lines.append("\n**Requirements:**")
+        lines.append(tr("spell.requirements"))
         requirements = evaluate_spell_requirements(player, spell_key)
         for met, text in requirements:
-            lines.append(f"{'✅' if met else '❌'} {text}")
+            lines.append(tr('spell_info.text_06', p0='✅' if met else '❌', p1=text))
 
         proof = player["practical_training"].get(spell_key, {})
         if proof.get("completed") or proof.get("objectives"):
-            lines.append("📚 Completed cooperative objectives count toward practical requirements.")
+            lines.append(tr('spell_info.text_07'))
 
         quiz_rule = QUIZ_RULES[spell["difficulty"]]
         quiz_required = quiz_rule["required_score"]
@@ -1684,18 +1710,18 @@ async def spell_info(ctx, *, spell_name: str):
             quiz_required = max(1, quiz_required - 1)
 
         lines.append(
-            f"\n🧠 Knowledge Trial: **{quiz_required}/{quiz_rule['questions']} required**"
+            tr('spell_info.text_08', p0=quiz_required, p1=quiz_rule['questions'])
         )
         if player.get("house") == "ravenclaw":
-            lines.append("🦅 Ravenclaw learning bonus applied.")
+            lines.append(tr('spell_info.text_09'))
 
     if spell_key == "avadakedavra" and spell_key in player["learned_spells"]:
         remaining = max(0, 5 - player["duels_since_avada"])
         if remaining == 0:
-            lines.append("\n💀 Availability: **READY**")
+            lines.append(tr('spell_info.text_10'))
         else:
-            lines.append(f"\n💀 Availability: **{remaining} completed Duels remaining**")
-        lines.append("Usage: **once every 5 completed Duels**")
+            lines.append(tr('spell_info.text_11', p0=remaining))
+        lines.append(tr('spell_info.text_12'))
 
     await ctx.send("\n".join(lines))
 
@@ -1706,32 +1732,32 @@ async def learn(ctx, *, spell_name: str):
     spell_key = normalize_spell_name(spell_name)
 
     if player["house"] is None:
-        await ctx.send("Create your Profile first with `!profile`.")
+        await ctx.send(tr('learn.text_01'))
         return
 
     if ctx.author.id in active_duels:
-        await ctx.send("⚠️ You cannot start a Learning Trial during a Duel.")
+        await ctx.send(tr('learn.text_02'))
         return
 
     if ctx.author.id in active_learning_trials:
         trial = active_learning_trials[ctx.author.id]
         await ctx.send(
-            f"🧠 You are already learning **{trial['display_name']}**. Finish it or use `!cancellearn`."
+            tr('learn.text_03', p0=trial['display_name'])
         )
         return
 
     if spell_key not in SPELLS:
-        await ctx.send("❌ Unknown spell.")
+        await ctx.send(tr('learn.text_04'))
         return
 
     spell = SPELLS[spell_key]
 
     if spell.get("starting"):
-        await ctx.send(f"✅ You already know **{spell['display_name']}**.")
+        await ctx.send(tr('learn.text_05', p0=spell['display_name']))
         return
 
     if spell_key in player["learned_spells"]:
-        await ctx.send(f"✅ You have already learned **{spell['display_name']}**.")
+        await ctx.send(tr('learn.text_06', p0=spell['display_name']))
         return
 
     requirements = evaluate_spell_requirements(player, spell_key)
@@ -1739,9 +1765,8 @@ async def learn(ctx, *, spell_name: str):
 
     if missing:
         await ctx.send(
-            f"🔒 **{spell['display_name']} cannot be learned yet.**\n\n"
-            "Missing requirements:\n"
-            + "\n".join(f"❌ {text}" for text in missing)
+            tr('learn.text_07', p0=spell['display_name'])
+            + "\n".join(tr('learn.text_08', p0=text) for text in missing)
         )
         return
 
@@ -1761,7 +1786,7 @@ async def learn(ctx, *, spell_name: str):
         )
     except ValueError:
         logger.exception("Knowledge Trial question selection failed for %s", spell_key)
-        await ctx.send("⚠️ The quiz question bank does not contain enough questions yet.")
+        await ctx.send(tr('learn.text_09'))
         return
 
     active_learning_trials[ctx.author.id] = {
@@ -1774,16 +1799,20 @@ async def learn(ctx, *, spell_name: str):
     }
 
     ravenclaw_text = (
-        "\n🦅 Ravenclaw bonus active: required score reduced by 1."
+        tr('learn.text_10')
         if ravenclaw_bonus
         else ""
     )
     await ctx.send(
-        f"📘 **{spell['display_name']} — Learning Trial**\n"
-        f"Difficulty: **{stars(difficulty)}**\n"
-        f"Questions: **{len(questions)}**\n"
-        f"Required Score: **{required_score}/{len(questions)}**"
-        f"{ravenclaw_text}"
+        tr(
+            'learn.text_11',
+            p0=spell['display_name'],
+            p1=stars(difficulty),
+            p2=len(questions),
+            p3=required_score,
+            p4=len(questions),
+            p5=ravenclaw_text,
+        )
     )
 
     await send_learning_question(ctx, active_learning_trials[ctx.author.id])
@@ -1793,12 +1822,12 @@ async def learn(ctx, *, spell_name: str):
 @commands.max_concurrency(1, per=commands.BucketType.user, wait=False)
 async def answer(ctx, choice: str):
     if ctx.author.id not in active_learning_trials:
-        await ctx.send("You do not have an active Learning Trial.")
+        await ctx.send(tr('answer.text_01'))
         return
 
     choice = choice.upper().strip()
     if choice not in {"A", "B", "C", "D"}:
-        await ctx.send("Answer with `!answer A`, `!answer B`, `!answer C`, or `!answer D`.")
+        await ctx.send(tr('answer.text_02'))
         return
 
     trial = active_learning_trials[ctx.author.id]
@@ -1806,16 +1835,15 @@ async def answer(ctx, choice: str):
 
     if choice == question["correct_letter"]:
         trial["score"] += 1
-        result_text = "✅ Correct!"
+        result_text = tr('answer.text_03')
     else:
-        result_text = "❌ Incorrect."
+        result_text = tr('answer.text_04')
 
     trial["current_question"] += 1
 
     if trial["current_question"] < len(trial["questions"]):
         await ctx.send(
-            f"{result_text}\n"
-            f"Current Score: **{trial['score']}/{trial['current_question']}**"
+            tr('answer.text_05', p0=result_text, p1=trial['score'], p2=trial['current_question'])
         )
         await send_learning_question(ctx, trial)
         return
@@ -1836,33 +1864,32 @@ async def answer(ctx, choice: str):
         persist_player(player)
 
         await ctx.send(
-            f"{result_text}\n\n"
-            f"📚 **TRIAL COMPLETE**\n"
-            f"Score: **{final_score}/{total}**\n"
-            f"Required: **{required_score}/{total}**\n\n"
-            f"✅ **SUCCESS!**\n"
-            f"{SPELLS[spell_key]['emoji']} You have learned **{display_name}**!"
+            tr(
+                'answer.text_06',
+                p0=result_text,
+                p1=final_score,
+                p2=total,
+                p3=required_score,
+                p4=total,
+                p5=SPELLS[spell_key]['emoji'],
+                p6=display_name,
+            )
         )
     else:
         await ctx.send(
-            f"{result_text}\n\n"
-            f"📚 **TRIAL COMPLETE**\n"
-            f"Score: **{final_score}/{total}**\n"
-            f"Required: **{required_score}/{total}**\n\n"
-            f"❌ **FAILED**\n"
-            f"You did not learn **{display_name}**. You can try again."
+            tr('answer.text_07', p0=result_text, p1=final_score, p2=total, p3=required_score, p4=total, p5=display_name)
         )
 
 
 @bot.command()
 async def cancellearn(ctx):
     if ctx.author.id not in active_learning_trials:
-        await ctx.send("You do not have an active Learning Trial.")
+        await ctx.send(tr('cancellearn.text_01'))
         return
 
     trial = active_learning_trials.pop(ctx.author.id)
     await ctx.send(
-        f"❌ Your **{trial['display_name']}** Learning Trial has been cancelled."
+        tr('cancellearn.text_02', p0=trial['display_name'])
     )
 
 
@@ -1941,16 +1968,30 @@ def gain_combat_spell_xp(player, spell, amount, training=False):
 
 
 def training_progress_message(session):
-    lines = [f"📚 **TRAINING SESSION — {SPELLS[session['spell']]['display_name']}**",
-             f"Teacher: **{session['teacher_name']}**", f"Student: **{session['student_name']}**", "", "**Objectives:**"]
+    token = CURRENT_LANGUAGE.set(language_for_context(SimpleNamespace(guild=SimpleNamespace(id=session.get("guild_id")))))
+    try:
+        return _training_progress_message(session)
+    finally:
+        CURRENT_LANGUAGE.reset(token)
+
+
+def _training_progress_message(session):
+    lines = [tr('training_progress_message.text_01', p0=SPELLS[session['spell']]['display_name']),
+             tr('training_progress_message.text_02', p0=session['teacher_name']), tr('training_progress_message.text_03', p0=session['student_name']), "", tr("training.objectives")]
     for objective in session["objectives"].values():
         total = objective["teacher"] + objective["student"]
         marker = "✅" if objective_complete(objective) else "⏳"
-        lines.extend([f"{marker} **{objective['label']}: {total}/{objective['target']}**",
-                      f"Teacher: {objective['teacher']} | Student: {objective['student']}"])
+        lines.extend([tr(
+            'training_progress_message.text_04',
+            p0=marker,
+            p1=localized_label(objective['label']),
+            p2=total,
+            p3=objective['target'],
+        ),
+                      tr('training_progress_message.text_05', p0=objective['teacher'], p1=objective['student'])])
         if objective["student"] == 0:
-            lines.append("⚠️ Student must contribute")
-    lines.append("Use `!training` to view progress or `!canceltraining` to leave.")
+            lines.append(tr('training_progress_message.text_06'))
+    lines.append(tr('training_progress_message.text_07'))
     return "\n".join(lines)
 
 
@@ -1963,6 +2004,7 @@ def clear_participant_requests(user_ids):
             duel_requests.pop(receiver)
 
 
+@localized_context
 async def end_training(ctx, session, reason, completed=False):
     if session.get("ending"):
         return
@@ -1994,26 +2036,31 @@ async def end_training(ctx, session, reason, completed=False):
     if ctx is None:
         return
     if completed:
-        message = (f"✅ **TRAINING COMPLETE**\n{session['student_name']} has completed practical training "
-                   f"for **{SPELLS[session['spell']]['display_name']}** with {session['teacher_name']}.\n")
+        message = (tr(
+            'end_training.text_01',
+            p0=session['student_name'],
+            p1=SPELLS[session['spell']]['display_name'],
+            p2=session['teacher_name'],
+        ))
         if can_learn_spell(student, session["spell"]):
-            message += f"The Knowledge Trial is now available: `!learn {session['spell']}`."
+            message += tr('end_training.text_02', p0=session['spell'])
         else:
-            message += "Practical training is saved. Remaining normal requirements must still be met before `!learn`."
+            message += tr('end_training.text_03')
     else:
-        message = f"📚 **Training ended:** {reason}\nCompleted objectives are saved; incomplete counters reset."
+        message = tr('end_training.text_04', p0=reason)
     try:
         await ctx.send(message)
     except discord.HTTPException:
         logger.exception("Could not announce training end; session was cleaned up")
 
 
+@localized_context
 async def report_training_progress(ctx, user_id, session_id=None):
     session = training_session(user_id)
     if session is None or (session_id is not None and session["id"] != session_id):
         return
     if all(objective_complete(obj) for obj in session["objectives"].values()):
-        await end_training(ctx, session, "Objectives completed", completed=True)
+        await end_training(ctx, session, tr('report_training_progress.text_01'), completed=True)
     elif session.pop("progress_dirty", False):
         await ctx.send(training_progress_message(session))
 
@@ -2032,30 +2079,30 @@ def has_teaching_request(user_id):
 
 def training_validation(teacher_user, student_user, spell_key):
     if teacher_user.id == student_user.id:
-        return "You cannot train yourself."
+        return tr('training_validation.text_01')
     if spell_key not in SPELLS:
-        return "❌ Unknown spell."
+        return tr('training_validation.text_02')
     teacher = get_player(teacher_user)
     student = get_player(student_user)
     if spell_key not in teacher["learned_spells"]:
-        return "The teacher has not learned that spell."
+        return tr('training_validation.text_03')
     if teacher["spell_levels"].get(spell_key, 0) < TEACHING_MIN_SPELL_LEVEL:
-        return f"The teacher needs **{SPELLS[spell_key]['display_name']} Spell Level {TEACHING_MIN_SPELL_LEVEL}**."
+        return tr('training_validation.text_04', p0=SPELLS[spell_key]['display_name'], p1=TEACHING_MIN_SPELL_LEVEL)
     if spell_key in student["learned_spells"]:
-        return "The student already knows that spell."
+        return tr('training_validation.text_05')
     if getattr(teacher_user, "bot", False) or getattr(student_user, "bot", False):
-        return "Both participants must be players."
+        return tr('training_validation.text_06')
     if not teacher["ready"] or not student["ready"]:
-        return "Both players must finish their profiles first."
+        return tr('training_validation.text_07')
     if any(uid in active_duels for uid in (teacher_user.id, student_user.id)):
-        return "One of you is already in a Duel or Training Session."
+        return tr('training_validation.text_08')
     if any(uid in active_learning_trials for uid in (teacher_user.id, student_user.id)):
-        return "Finish your current Knowledge Trial before training."
+        return tr('training_validation.text_09')
     missing = [text for met, text in evaluate_spell_requirements(student, spell_key, include_practical=False) if not met]
     if missing:
-        return "The student must meet the normal prerequisites first:\n" + "\n".join(missing)
+        return tr('training_validation.text_10') + "\n".join(missing)
     if not build_training_objectives(student, spell_key):
-        return "The practical requirements are already satisfied, or this spell has no practical objectives. Use `!learn`."
+        return tr('training_validation.text_11')
     return None
 
 
@@ -2067,14 +2114,14 @@ async def create_teaching_request(ctx, teacher_user, student_user, spell_name, r
         return
     for uid in (teacher_user.id, student_user.id):
         if has_teaching_request(uid):
-            await ctx.send("One of you already has a pending teaching request. Decline or cancel it first.")
+            await ctx.send(tr('create_teaching_request.text_01'))
             return
     for target, request in list(duel_requests.items()):
         if time.time() >= request["expires"]:
             duel_requests.pop(target)
     if any(target in (teacher_user.id, student_user.id) or request["challenger_id"] in (teacher_user.id, student_user.id)
            for target, request in duel_requests.items()):
-        await ctx.send("Resolve pending normal Duel requests before requesting training.")
+        await ctx.send(tr('create_teaching_request.text_02'))
         return
     teaching_requests[receiver.id] = {
         "teacher_id": teacher_user.id, "student_id": student_user.id, "spell": spell_key,
@@ -2084,19 +2131,23 @@ async def create_teaching_request(ctx, teacher_user, student_user, spell_name, r
     }
     logger.info("Teaching request created: teacher=%s student=%s spell=%s", teacher_user.id, student_user.id, spell_key)
     await ctx.send(
-        f"📚 **Training request — {SPELLS[spell_key]['display_name']}**\n"
-        f"Teacher: **{teacher_user.display_name}**\nStudent: **{student_user.display_name}**\n"
-        f"{receiver.display_name}, use `!accept` or `!decline` here within 2 minutes."
+        tr(
+            'create_teaching_request.text_03',
+            p0=SPELLS[spell_key]['display_name'],
+            p1=teacher_user.display_name,
+            p2=student_user.display_name,
+            p3=receiver.display_name,
+        )
     )
 
 
 async def request_kind(ctx, selected):
     if selected is not None and selected not in {"training", "duel"}:
-        await ctx.send("Use `!accept training` / `!accept duel` (or the equivalent `!decline`).")
+        await ctx.send(tr('request_kind.text_01'))
         return None
     if selected is None:
         if ctx.author.id in teaching_requests and ctx.author.id in duel_requests:
-            await ctx.send("You have both requests. Choose `training` or `duel` after `!accept` or `!decline`.")
+            await ctx.send(tr('request_kind.text_02'))
             return None
         selected = "training" if ctx.author.id in teaching_requests else "duel"
     return selected
@@ -2110,27 +2161,27 @@ async def training_member(ctx, user_id):
 async def accept_training(ctx):
     request = teaching_requests.get(ctx.author.id)
     if request is None:
-        await ctx.send("You have no teaching request.")
+        await ctx.send(tr('accept_training.text_01'))
         return
     if time.time() >= request["expires"]:
         teaching_requests.pop(ctx.author.id)
-        await ctx.send("This teaching request has expired.")
+        await ctx.send(tr('accept_training.text_02'))
         return
     if ctx.channel.id != request["channel_id"]:
-        await ctx.send("Accept training in the channel where it was requested.")
+        await ctx.send(tr('accept_training.text_03'))
         return
     try:
         teacher_user = await training_member(ctx, request["teacher_id"])
         student_user = await training_member(ctx, request["student_id"])
     except discord.HTTPException:
         teaching_requests.pop(ctx.author.id, None)
-        await ctx.send("A participant is unavailable. The teaching request was cancelled.")
+        await ctx.send(tr('accept_training.text_04'))
         return
     if teaching_requests.get(ctx.author.id) is not request:
         return
     error = training_validation(teacher_user, student_user, request["spell"])
     if time.time() >= request["expires"]:
-        error = "This teaching request has expired."
+        error = tr('accept_training.text_05')
     if error:
         teaching_requests.pop(ctx.author.id, None)
         await ctx.send(error)
@@ -2174,7 +2225,7 @@ async def askhelp(ctx, teacher: discord.Member, *, spell_name: str):
 async def training(ctx):
     session = training_session(ctx.author.id)
     if session is None:
-        await ctx.send("You have no active Training Session.")
+        await ctx.send(tr('training.text_01'))
     else:
         await ctx.send(training_progress_message(session))
 
@@ -2183,19 +2234,19 @@ async def training(ctx):
 async def canceltraining(ctx):
     session = training_session(ctx.author.id)
     if session is not None:
-        await end_training(ctx, session, f"{ctx.author.display_name} left the session")
+        await end_training(ctx, session, tr('canceltraining.text_01', p0=ctx.author.display_name))
     elif has_teaching_request(ctx.author.id):
         clear_participant_requests({ctx.author.id})
-        await ctx.send("Pending teaching request cancelled.")
+        await ctx.send(tr('canceltraining.text_02'))
     else:
-        await ctx.send("You have no Training Session or teaching request to cancel.")
+        await ctx.send(tr('canceltraining.text_03'))
 
 
 @bot.event
 async def on_member_remove(member):
     session = duel_sessions.get(member.id)
     if session and session.get("guild_id") == member.guild.id:
-        await abort_session(session, "A participant left the server")
+        await abort_session(session, tr('on_member_remove.text_01'))
     for receiver, request in list(teaching_requests.items()):
         if request["guild_id"] == member.guild.id and member.id in (request["teacher_id"], request["student_id"]):
             teaching_requests.pop(receiver)
@@ -2205,7 +2256,7 @@ async def on_member_remove(member):
 async def on_guild_channel_delete(channel):
     for session in list(duel_sessions.values()):
         if session["channel_id"] == channel.id:
-            await abort_session(session, "Combat channel was deleted")
+            await abort_session(session, tr('on_guild_channel_delete.text_01'))
     for receiver, request in list(teaching_requests.items()):
         if request["channel_id"] == channel.id:
             teaching_requests.pop(receiver)
@@ -2218,7 +2269,7 @@ async def on_guild_channel_delete(channel):
 async def on_guild_remove(guild):
     for session in list(duel_sessions.values()):
         if session.get("guild_id") == guild.id:
-            await abort_session(session, "The bot left the server")
+            await abort_session(session, tr('on_guild_remove.text_01'))
     for receiver, request in list(teaching_requests.items()):
         if request["guild_id"] == guild.id:
             teaching_requests.pop(receiver)
@@ -2234,42 +2285,41 @@ async def duel(ctx, target: discord.Member):
     target_player = get_player(target)
 
     if not challenger["ready"]:
-        await ctx.send("⚠️ Finish creating your character with `!profile` first.")
+        await ctx.send(tr('duel.text_01'))
         return
 
     if not target_player["ready"]:
-        await ctx.send(f"⚠️ {target.display_name} has not finished their Profile.")
+        await ctx.send(tr('duel.text_02', p0=target.display_name))
         return
 
     if target.id == ctx.author.id:
-        await ctx.send("You cannot Duel yourself.")
+        await ctx.send(tr('duel.text_03'))
         return
 
     if ctx.author.id in active_duels or target.id in active_duels:
-        await ctx.send("One of you is already in a Duel.")
+        await ctx.send(tr('duel.text_04'))
         return
 
     if has_teaching_request(ctx.author.id) or has_teaching_request(target.id):
-        await ctx.send("Resolve your pending teaching request before starting a normal Duel.")
+        await ctx.send(tr('duel.text_05'))
         return
 
     if getattr(target, "bot", False):
-        await ctx.send("Challenge another player.")
+        await ctx.send(tr('duel.text_06'))
         return
     if any(uid in active_learning_trials for uid in (ctx.author.id, target.id)):
-        await ctx.send("Finish Knowledge Trials before dueling.")
+        await ctx.send(tr('duel.text_07'))
         return
     for uid, request in list(duel_requests.items()):
         if time.time() >= request["expires"]:
             duel_requests.pop(uid)
     if any(uid in (ctx.author.id, target.id) or request["challenger_id"] in (ctx.author.id, target.id)
            for uid, request in duel_requests.items()):
-        await ctx.send("Resolve existing Duel requests first.")
+        await ctx.send(tr('duel.text_08'))
         return
     duel_requests[target.id] = {"challenger_id": ctx.author.id, "expires": time.time() + DUEL_REQUEST_TTL, "channel_id": ctx.channel.id}
     await ctx.send(
-        f"⚔️ **{ctx.author.display_name} challenges {target.display_name} to a Duel!**\n"
-        f"{target.display_name}, use `!accept` or `!decline`."
+        tr('duel.text_09', p0=ctx.author.display_name, p1=target.display_name, p2=target.display_name)
     )
 
 
@@ -2281,24 +2331,24 @@ async def decline(ctx, request_type: str = None):
     if kind == "training":
         request = teaching_requests.get(ctx.author.id)
         if request is None:
-            await ctx.send("You have no teaching request.")
+            await ctx.send(tr('decline.text_01'))
             return
         if ctx.channel.id != request["channel_id"]:
-            await ctx.send("Decline teaching in the channel where it was requested.")
+            await ctx.send(tr('decline.text_02'))
             return
         teaching_requests.pop(ctx.author.id)
         logger.info("Teaching request declined by %s", ctx.author.id)
-        await ctx.send(f"📚 Teaching request for **{SPELLS[request['spell']]['display_name']}** declined.")
+        await ctx.send(tr('decline.text_03', p0=SPELLS[request['spell']]['display_name']))
         return
     if ctx.author.id not in duel_requests:
-        await ctx.send("You have no Duel request.")
+        await ctx.send(tr('decline.text_04'))
         return
 
     challenger_id = duel_requests.pop(ctx.author.id)["challenger_id"]
     challenger = await bot.fetch_user(challenger_id)
 
     await ctx.send(
-        f"❌ {ctx.author.display_name} declined the Duel against {challenger.display_name}."
+        tr('decline.text_05', p0=ctx.author.display_name, p1=challenger.display_name)
     )
 
 
@@ -2311,37 +2361,37 @@ async def accept(ctx, request_type: str = None):
         await accept_training(ctx)
         return
     if ctx.author.id not in duel_requests:
-        await ctx.send("You have no Duel request.")
+        await ctx.send(tr('accept.text_01'))
         return
 
     request = duel_requests[ctx.author.id]
     challenger_id = request["challenger_id"]
     if time.time() >= request["expires"]:
         duel_requests.pop(ctx.author.id)
-        await ctx.send("This Duel request has expired. Ask for a new challenge.")
+        await ctx.send(tr('accept.text_02'))
         return
     if ctx.channel.id != request["channel_id"]:
-        await ctx.send("Accept the challenge in the channel where it was sent.")
+        await ctx.send(tr('accept.text_03'))
         return
     if ctx.author.id in active_duels or challenger_id in active_duels:
         duel_requests.pop(ctx.author.id)
-        await ctx.send("One of you is already in a Duel.")
+        await ctx.send(tr('accept.text_04'))
         return
     challenger = await bot.fetch_user(challenger_id)
     player1 = get_player(challenger)
     player2 = get_player(ctx.author)
     if not player1["ready"] or not player2["ready"]:
-        await ctx.send("Both players must finish their profiles first.")
+        await ctx.send(tr('accept.text_05'))
         return
     if duel_requests.get(ctx.author.id) is not request or time.time() >= request["expires"]:
-        await ctx.send("This request has changed or expired. Request a new Duel.")
+        await ctx.send(tr('accept.text_06'))
         return
     if any(uid in active_learning_trials or has_teaching_request(uid) for uid in (ctx.author.id, challenger_id)):
-        await ctx.send("Finish pending learning or teaching first.")
+        await ctx.send(tr('accept.text_07'))
         return
     # Reserve the session without awaiting between validation and mutation.
     if ctx.author.id in active_duels or challenger_id in active_duels:
-        await ctx.send("One of you is already in a Duel.")
+        await ctx.send(tr('accept.text_08'))
         return
     duel_requests.pop(ctx.author.id)
     session = {"id": uuid.uuid4().hex, "mode": "normal", "channel_id": ctx.channel.id,
@@ -2368,13 +2418,15 @@ async def accept(ctx, request_type: str = None):
     persist_runtime()
 
     await ctx.send(
-        f"⚔️ **Duel accepted!**\n\n"
-        f"{challenger.display_name} ({HOUSE_NAMES[player1['house']]})\n"
-        f"❤️ {player1['max_hp']} HP\n\n"
-        f"VS\n\n"
-        f"{ctx.author.display_name} ({HOUSE_NAMES[player2['house']]})\n"
-        f"❤️ {player2['max_hp']} HP\n\n"
-        f"🪄 **Let the Duel begin!**"
+        tr(
+            'accept.text_09',
+            p0=challenger.display_name,
+            p1=house_display(player1['house']),
+            p2=player1['max_hp'],
+            p3=ctx.author.display_name,
+            p4=house_display(player2['house']),
+            p5=player2['max_hp'],
+        )
     )
 
 
@@ -2385,19 +2437,19 @@ async def accept(ctx, request_type: str = None):
 @bot.command()
 async def confringo(ctx):
     if ctx.author.id not in active_duels:
-        await ctx.send("You are not currently in a Duel.")
+        await ctx.send(tr('confringo.text_01'))
         return
 
     player = get_player(ctx.author)
 
     if is_unarmed(ctx.author.id):
         await ctx.send(
-            f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
+            tr('confringo.text_02', p0=remaining_unarmed_time(ctx.author.id))
         )
         return
 
     if ctx.author.id in pending_attacks:
-        await ctx.send("⚠️ You must react to the incoming Attack first.")
+        await ctx.send(tr('confringo.text_03'))
         return
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
@@ -2420,22 +2472,22 @@ async def confringo(ctx):
 @bot.command()
 async def sectumsempra(ctx):
     if ctx.author.id not in active_duels:
-        await ctx.send("You are not currently in a Duel.")
+        await ctx.send(tr('sectumsempra.text_01'))
         return
 
     player = get_player(ctx.author)
     if not knows_spell(player, "sectumsempra"):
-        await ctx.send("🔒 You have not learned **Sectumsempra** yet.")
+        await ctx.send(tr('sectumsempra.text_02'))
         return
 
     if is_unarmed(ctx.author.id):
         await ctx.send(
-            f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
+            tr('sectumsempra.text_03', p0=remaining_unarmed_time(ctx.author.id))
         )
         return
 
     if ctx.author.id in pending_attacks:
-        await ctx.send("⚠️ You must react to the incoming Attack first.")
+        await ctx.send(tr('sectumsempra.text_04'))
         return
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
@@ -2457,45 +2509,45 @@ async def sectumsempra(ctx):
 @bot.command()
 async def avadakedavra(ctx):
     if ctx.author.id not in active_duels:
-        await ctx.send("You are not currently in a Duel.")
+        await ctx.send(tr('avadakedavra.text_01'))
         return
 
     player = get_player(ctx.author)
 
     if is_stunned(ctx.author.id):
         await ctx.send(
-            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+            tr('avadakedavra.text_02', p0=remaining_stun_time(ctx.author.id))
         )
         return
 
     if not knows_spell(player, "avadakedavra"):
-        await ctx.send("🔒 You have not learned **Avada Kedavra** yet.")
+        await ctx.send(tr('avadakedavra.text_03'))
         return
 
     if player["duels_since_avada"] < 5:
         remaining = 5 - player["duels_since_avada"]
         await ctx.send(
-            f"💀 Avada Kedavra is unavailable. Complete **{remaining} more Duel{'s' if remaining != 1 else ''}** before using it again."
+            tr('avadakedavra.text_04', p0=remaining, p1='s' if remaining != 1 else '')
         )
         return
 
     if is_unarmed(ctx.author.id):
         await ctx.send(
-            f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
+            tr('avadakedavra.text_05', p0=remaining_unarmed_time(ctx.author.id))
         )
         return
 
     if ctx.author.id in pending_attacks:
-        await ctx.send("⚠️ You must react to the incoming Attack first.")
+        await ctx.send(tr('avadakedavra.text_06'))
         return
 
     if ctx.author.id in active_casts:
-        await ctx.send("⏳ Your previous spell has not been resolved yet.")
+        await ctx.send(tr('avadakedavra.text_07'))
         return
 
     if is_on_cooldown(ctx.author.id):
         await ctx.send(
-            f"⏳ You are recovering for another **{remaining_cooldown(ctx.author.id):.1f} seconds**."
+            tr('avadakedavra.text_08', p0=remaining_cooldown(ctx.author.id))
         )
         return
 
@@ -2503,16 +2555,16 @@ async def avadakedavra(ctx):
 
     if opponent.id in pending_attacks:
         await ctx.send(
-            f"⚠️ {opponent.display_name} already has an Attack to react to."
+            tr('avadakedavra.text_09', p0=opponent.display_name)
         )
         return
 
     if active_duels.get(ctx.author.id) != opponent.id:
-        await ctx.send("This Duel has ended.")
+        await ctx.send(tr('avadakedavra.text_10'))
         return
 
     if not note_duel_activity(ctx.author.id, session_id=getattr(ctx, "combat_session_id", None), channel_id=ctx.channel.id):
-        await ctx.send("This Duel has ended or expired.")
+        await ctx.send(tr('avadakedavra.text_11'))
         return
 
     # The attempt is consumed immediately, hit or miss.
@@ -2525,7 +2577,7 @@ async def avadakedavra(ctx):
     # Hidden 1d6 roll: 5-6 succeeds, 1-4 misses.
     if random.randint(1, 6) < 5:
         start_cooldown(ctx.author.id, 25)
-        await ctx.send("❌ **Spell missed.**")
+        await ctx.send(tr('avadakedavra.text_12'))
         return
 
     power = calculate_spell_power(player, "avadakedavra")
@@ -2544,12 +2596,12 @@ async def avadakedavra(ctx):
 @bot.command()
 async def protego(ctx):
     if ctx.author.id not in pending_attacks:
-        await ctx.send("🛡️ There is no Attack to block.")
+        await ctx.send(tr('protego.text_01'))
         return
 
     if is_stunned(ctx.author.id):
         await ctx.send(
-            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+            tr('protego.text_02', p0=remaining_stun_time(ctx.author.id))
         )
         return
 
@@ -2558,7 +2610,7 @@ async def protego(ctx):
     attack = pending_attacks[ctx.author.id]
     defense_power = calculate_protego_power(defender)
     if not note_duel_activity(ctx.author.id, attack["session_id"], ctx.channel.id):
-        await ctx.send("This Duel has ended or expired.")
+        await ctx.send(tr('protego.text_03'))
         return
 
     del pending_attacks[ctx.author.id]
@@ -2574,23 +2626,19 @@ async def protego(ctx):
             defender["hp"] = max(0, defender["hp"] - chip)
             persist_player(defender)
             await ctx.send(
-                f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
-                f"✨ Most of the Attack is blocked, but **{chip} damage** gets through!\n"
-                f"❤️ HP: **{defender['hp']}/{defender['max_hp']}**"
+                tr('protego.text_04', p0=ctx.author.display_name, p1=chip, p2=defender['hp'], p3=defender['max_hp'])
             )
             if await check_duel_end(ctx, ctx.author, attack["session_id"]):
                 return
         else:
             await ctx.send(
-                f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
-                f"✨ The Attack is blocked!\n"
+                tr('protego.text_05', p0=ctx.author.display_name)
             )
 
         await apply_sectumsempra_backlash(ctx, attack, defense_power)
     else:
         await ctx.send(
-            f"🛡️ **{ctx.author.display_name} casts PROTEGO!**\n"
-            f"💥 Protego is broken!\n"
+            tr('protego.text_06', p0=ctx.author.display_name)
 
         )
         await apply_attack(ctx, ctx.author, attack)
@@ -2601,12 +2649,12 @@ async def protego(ctx):
 @bot.command()
 async def dodge(ctx):
     if ctx.author.id not in pending_attacks:
-        await ctx.send("💨 There is no Attack to Dodge.")
+        await ctx.send(tr('dodge.text_01'))
         return
 
     if is_stunned(ctx.author.id):
         await ctx.send(
-            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+            tr('dodge.text_02', p0=remaining_stun_time(ctx.author.id))
         )
         return
 
@@ -2616,7 +2664,7 @@ async def dodge(ctx):
     dodge_power = calculate_dodge_power(defender)
     attack_accuracy = attack["accuracy"]
     if not note_duel_activity(ctx.author.id, attack["session_id"], ctx.channel.id):
-        await ctx.send("This Duel has ended or expired.")
+        await ctx.send(tr('dodge.text_03'))
         return
 
     del pending_attacks[ctx.author.id]
@@ -2627,14 +2675,12 @@ async def dodge(ctx):
         gain_combat_player_xp(defender, 5, training=training)
 
         await ctx.send(
-            f"💨 **{ctx.author.display_name} Dodges!**\n"
-            f"✨ {SPELLS[attack['spell']]['display_name'].upper()} misses!\n"
+            tr('dodge.text_04', p0=ctx.author.display_name, p1=SPELLS[attack['spell']]['display_name'].upper())
 
         )
     else:
         await ctx.send(
-            f"💨 **{ctx.author.display_name} tries to Dodge!**\n"
-            f"❌ The Dodge fails.\n"
+            tr('dodge.text_05', p0=ctx.author.display_name)
 
         )
         await apply_attack(ctx, ctx.author, attack)
@@ -2645,7 +2691,7 @@ async def dodge(ctx):
 @bot.command()
 async def expelliarmus(ctx):
     if ctx.author.id not in active_duels:
-        await ctx.send("You are not currently in a Duel.")
+        await ctx.send(tr('expelliarmus.text_01'))
         return
 
     player = get_player(ctx.author)
@@ -2653,13 +2699,13 @@ async def expelliarmus(ctx):
 
     if is_stunned(ctx.author.id):
         await ctx.send(
-            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+            tr('expelliarmus.text_02', p0=remaining_stun_time(ctx.author.id))
         )
         return
 
     if is_unarmed(ctx.author.id):
         await ctx.send(
-            f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
+            tr('expelliarmus.text_03', p0=remaining_unarmed_time(ctx.author.id))
         )
         return
 
@@ -2668,7 +2714,7 @@ async def expelliarmus(ctx):
     if ctx.author.id in pending_attacks:
         incoming_attack = pending_attacks[ctx.author.id]
         if not note_duel_activity(ctx.author.id, incoming_attack["session_id"], ctx.channel.id):
-            await ctx.send("This Duel has ended or expired.")
+            await ctx.send(tr('expelliarmus.text_04'))
             return
         attacker_id = incoming_attack["attacker_id"]
         attacker = await bot.fetch_user(attacker_id)
@@ -2686,9 +2732,12 @@ async def expelliarmus(ctx):
             record_combat_success(player, "combat_stats", "successful_counters")
 
             await ctx.send(
-                f"⚡ **{ctx.author.display_name} counters with EXPELLIARMUS!**\n"
-                f"💥 {SPELLS[incoming_attack['spell']]['display_name'].upper()} is interrupted!\n"
-                f"🪄 {attacker.display_name} is unarmed for **4 seconds**!\n"
+                tr(
+                    'expelliarmus.text_05',
+                    p0=ctx.author.display_name,
+                    p1=SPELLS[incoming_attack['spell']]['display_name'].upper(),
+                    p2=attacker.display_name,
+                )
 
             )
 
@@ -2699,8 +2748,7 @@ async def expelliarmus(ctx):
             await apply_sectumsempra_backlash(ctx, incoming_attack, expelliarmus_power)
         else:
             await ctx.send(
-                f"⚡ **{ctx.author.display_name} counters with EXPELLIARMUS!**\n"
-                f"❌ The counter fails.\n"
+                tr('expelliarmus.text_06', p0=ctx.author.display_name)
 
             )
             await apply_attack(ctx, ctx.author, incoming_attack)
@@ -2739,16 +2787,16 @@ async def expelliarmus(ctx):
 async def modeled_spell(ctx, spell_key):
     player = get_player(ctx.author)
     if spell_key not in player["learned_spells"]:
-        await ctx.send(f"🔒 You have not learned **{SPELLS[spell_key]['display_name']}** yet.")
+        await ctx.send(tr('modeled_spell.text_01', p0=SPELLS[spell_key]['display_name']))
         return
     if ctx.author.id not in active_duels:
-        await ctx.send("You are not currently in a Duel.")
+        await ctx.send(tr('modeled_spell.text_02'))
         return
     if is_unarmed(ctx.author.id):
-        await ctx.send("You are unarmed.")
+        await ctx.send(tr('modeled_spell.text_03'))
         return
     if ctx.author.id in pending_attacks:
-        await ctx.send("React to the incoming Attack first.")
+        await ctx.send(tr('modeled_spell.text_04'))
         return
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
     effect = roll_offensive_effect(spell_key, player["spell_levels"][spell_key])
@@ -2760,29 +2808,29 @@ async def modeled_spell(ctx, spell_key):
 @bot.command()
 async def stupefy(ctx):
     if ctx.author.id not in active_duels:
-        await ctx.send("You are not currently in a Duel.")
+        await ctx.send(tr('stupefy.text_01'))
         return
 
     player = get_player(ctx.author)
 
     if not knows_spell(player, "stupefy"):
-        await ctx.send("🔒 You have not learned **Stupefy** yet.")
+        await ctx.send(tr('stupefy.text_02'))
         return
 
     if is_stunned(ctx.author.id):
         await ctx.send(
-            f"💫 You are stunned for another **{remaining_stun_time(ctx.author.id):.1f} seconds**."
+            tr('stupefy.text_03', p0=remaining_stun_time(ctx.author.id))
         )
         return
 
     if is_unarmed(ctx.author.id):
         await ctx.send(
-            f"🪄 You are unarmed for another **{remaining_unarmed_time(ctx.author.id):.1f} seconds**."
+            tr('stupefy.text_04', p0=remaining_unarmed_time(ctx.author.id))
         )
         return
 
     if ctx.author.id in pending_attacks:
-        await ctx.send("⚠️ You must react to the incoming Attack first.")
+        await ctx.send(tr('stupefy.text_05'))
         return
 
     opponent = await bot.fetch_user(active_duels[ctx.author.id])
@@ -2852,10 +2900,11 @@ def owner_only(ctx):
     return is_owner(ctx.author)
 
 
+@localized_context
 async def owner_check(ctx):
     if owner_only(ctx):
         return True
-    await ctx.send("❌ You are not allowed to use this command.")
+    await ctx.send(tr('owner_check.text_01'))
     return False
 
 
@@ -3135,7 +3184,7 @@ def ranking_display_name(ctx, entry):
     guild = getattr(ctx, "guild", None)
     member = guild.get_member(entry["user_id"]) if guild else None
     cached = member or bot.get_user(entry["user_id"])
-    name = getattr(cached, "display_name", None) or entry["name"] or f"Player {entry['user_id']}"
+    name = getattr(cached, "display_name", None) or entry["name"] or tr("ranking.player", user_id=entry["user_id"])
     name = str(name).replace("\n", " ").replace("\r", " ")[:60]
     return discord.utils.escape_mentions(discord.utils.escape_markdown(name))
 
@@ -3143,16 +3192,16 @@ def ranking_display_name(ctx, entry):
 async def send_player_leaderboard(ctx, global_points=False):
     guild_id = None if global_points else ctx.guild.id
     entries, personal = database.player_leaderboard(ctx.author.id, guild_id)
-    title = "🌍 **DUELLIUM GLOBAL LEADERBOARD**" if global_points else "🏆 **SERVER LEADERBOARD**"
+    title = tr('send_player_leaderboard.text_01') if global_points else tr('send_player_leaderboard.text_02')
     lines = [title]
-    lines.extend(f"#{entry['rank']} {ranking_display_name(ctx, entry)} — {entry['points']} pts" for entry in entries)
+    lines.extend(tr('send_player_leaderboard.text_03', p0=entry['rank'], p1=ranking_display_name(ctx, entry), p2=entry['points']) for entry in entries)
     if not entries:
-        lines.append("No ranked results yet.")
+        lines.append(tr('send_player_leaderboard.text_04'))
     if personal is None:
-        lines.append("\nYour Global Rank: Unranked — 0 pts" if global_points else "\nYour Rank: Unranked — 0 pts")
+        lines.append(tr('send_player_leaderboard.text_05') if global_points else tr('send_player_leaderboard.text_06'))
     elif personal[0] > 10:
-        label = "Your Global Rank" if global_points else "Your Rank"
-        lines.append(f"\n{label}: #{personal[0]} — {personal[1]} pts")
+        label = tr('send_player_leaderboard.text_07') if global_points else tr('send_player_leaderboard.text_08')
+        lines.append(tr('send_player_leaderboard.text_09', p0=label, p1=personal[0], p2=personal[1]))
     await ctx.send("\n".join(lines))
 
 
@@ -3171,9 +3220,9 @@ async def globalleaderboard(ctx):
 @commands.guild_only()
 async def houseleaderboard(ctx):
     rows = database.house_leaderboard(ctx.guild.id)
-    lines = ["🏆 **HOUSE LEADERBOARD**"]
+    lines = [tr('houseleaderboard.text_01')]
     for medal, (house, points) in zip(("🥇", "🥈", "🥉", "4."), rows):
-        lines.append(f"{medal} {HOUSE_NAMES[house]} — {points} pts")
+        lines.append(tr('houseleaderboard.text_02', p0=medal, p1=house_display(house), p2=points))
     await ctx.send("\n".join(lines))
 
 
@@ -3222,6 +3271,54 @@ async def leaveguild(ctx, guild_id: int):
         await ctx.send(f"✅ Duellium left {name} ({guild.id}).")
 
 
+@localized_context
+async def language_permission(ctx):
+    permissions = getattr(ctx.author, "guild_permissions", None)
+    if (is_owner(ctx.author) or getattr(permissions, "manage_guild", False)
+            or getattr(permissions, "administrator", False)):
+        return True
+    await ctx.send(tr("language.permission"))
+    return False
+
+
+@bot.command()
+@commands.guild_only()
+async def language(ctx):
+    current = language_for_context(ctx)
+    await ctx.send(translate(current, "language.current", name=LANGUAGE_NAMES[current]))
+
+
+@bot.command()
+@commands.guild_only()
+@commands.check(language_permission)
+async def setlanguage(ctx, language: str):
+    normalized = LANGUAGE_INPUTS.get(language.strip().casefold())
+    if normalized is None:
+        await ctx.send(tr("language.invalid"))
+        return
+    database.set_guild_language(ctx.guild.id, normalized)
+    guild_language_cache[ctx.guild.id] = normalized
+    CURRENT_LANGUAGE.set(normalized)
+    await ctx.send(translate(normalized, "language.changed." + normalized))
+
+
+bot.remove_command("help")
+
+
+@bot.command(name="help")
+async def localized_help(ctx, *, command_name: str = None):
+    if command_name is None:
+        await ctx.send(tr("help.title") + "\n\n" + tr("help.summary"))
+        return
+    command = bot.get_command(command_name.lstrip("!"))
+    if command is None or (owner_check in command.checks and not is_owner(ctx.author)):
+        await ctx.send(tr("help.unknown"))
+        return
+    display = COMMAND_ALIASES.get(language_for_context(ctx), {}).get(command.name, command.name)
+    usage = f"!{display} {command_signature(command.signature)}".rstrip()
+    await ctx.send(tr("help.usage", usage=usage) + "\n" + tr("help.english", command=command.name))
+
+
 @bot.command()
 @commands.check(owner_check)
 async def botstatus(ctx):
@@ -3252,25 +3349,26 @@ async def backupdb(ctx):
 
 
 @bot.event
+@localized_context
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        message = f"Missing `{error.param.name}`. Use `!help {ctx.command}`."
+        message = tr('on_command_error.text_01', p0=parameter_display(error.param.name), p1=ctx.command)
     elif isinstance(error, commands.MemberNotFound):
-        message = "Player not found. Mention a member of this server."
+        message = tr('on_command_error.text_02')
     elif isinstance(error, commands.NoPrivateMessage):
-        message = "Use this command in a server channel."
+        message = tr('on_command_error.text_03')
     elif isinstance(error, (commands.MissingPermissions, commands.NotOwner)):
-        message = "You do not have permission to use this command."
+        message = tr('on_command_error.text_04')
     elif isinstance(error, commands.BotMissingPermissions):
-        message = "The bot is missing channel permissions. Ask the server owner to check them."
+        message = tr('on_command_error.text_05')
     elif isinstance(error, commands.CheckFailure):
         return  # Existing checks already explain their rejection.
     elif isinstance(error, commands.UserInputError):
-        message = f"Invalid arguments. Use `!help {ctx.command}`; numbers must be whole numbers."
+        message = tr('on_command_error.text_06', p0=ctx.command)
     elif isinstance(error, commands.MaxConcurrencyReached):
-        message = "Your previous answer is still being processed."
+        message = tr('on_command_error.text_07')
     else:
         original = getattr(error, "original", error)
         logger.error("Command %s failed for user %s", ctx.command, ctx.author.id,
@@ -3283,7 +3381,7 @@ async def on_command_error(ctx, error):
         session = duel_sessions.get(ctx.author.id)
         if session is not None and not session.get("ending"):
             try:
-                await abort_session(session, "An internal error interrupted combat")
+                await abort_session(session, tr('on_command_error.text_08'))
             except Exception:
                 logger.exception("Failed to persist aborted combat")
         if isinstance(original, sqlite3.Error):
@@ -3298,7 +3396,7 @@ async def on_command_error(ctx, error):
                 except Exception:
                     players.pop(uid, None)
             active_learning_trials.pop(ctx.author.id, None)
-        message = "The command could not be completed. Please try again; details were recorded in the owner logs."
+        message = tr('on_command_error.text_09')
     try:
         await ctx.send(message)
     except discord.HTTPException:
@@ -3311,6 +3409,7 @@ async def capture_combat_session(ctx):
 
 
 @bot.check
+@localized_context
 async def guild_context(ctx):
     if ctx.guild is None and ctx.command.name not in {"botstatus", "backupdb", "help", "test", "servers", "leaveguild"}:
         raise commands.NoPrivateMessage()
@@ -3362,6 +3461,9 @@ async def run_bot():
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await bot.close()
+
+
+localized_alias_check = install_command_localization(bot)
 
 
 def validate_configuration(token, owner_id):
